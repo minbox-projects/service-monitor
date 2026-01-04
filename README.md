@@ -16,9 +16,6 @@ A lightweight Python tool to monitor Docker containers and tail log files for er
 
 2. **Installation**
    ```bash
-   cd Tools/service_monitor
-   python3 -m venv venv
-   source venv/bin/activate
    pip install -r requirements.txt
    ```
 
@@ -47,7 +44,6 @@ A lightweight Python tool to monitor Docker containers and tail log files for er
 
 4. **Running the Monitor**
    ```bash
-   source venv/bin/activate
    python3 monitor.py [optional_config_path]
    ```
    
@@ -58,27 +54,27 @@ A lightweight Python tool to monitor Docker containers and tail log files for er
 
 ## Deployment as System Service (Ubuntu/Systemd)
 
-For permanent background execution and auto-restart on boot, use the provided `service_monitor.service` file. 
+For permanent background execution and auto-restart on boot, use the provided `service-monitor.service` file. 
 
-**Note**: Ensure the `WorkingDirectory` and `ExecStart` paths in `service_monitor.service` match your server deployment path (e.g., `/home/huanwei/monitor`).
+**Note**: Ensure the `WorkingDirectory` and `ExecStart` paths in `service-monitor.service` match your server deployment path (e.g., `/home/huanwei/monitor`).
 
 1. **Move service file to system directory**:
    ```bash
-   sudo cp service_monitor.service /etc/systemd/system/
+   sudo cp service-monitor.service /etc/systemd/system/
    ```
 
 2. **Reload and start**:
    ```bash
    sudo systemctl daemon-reload
-   sudo systemctl enable service_monitor
-   sudo systemctl start service_monitor
+   sudo systemctl enable service-monitor
+   sudo systemctl start service-monitor
    ```
 
 3. **Check status and logs**:
    ```bash
-   sudo systemctl status service_monitor
+   sudo systemctl status service-monitor
    # Use -f to tail logs and -u for specific service
-   sudo journalctl -u service_monitor -f
+   sudo journalctl -u service-monitor -f
    ```
 
 ## Notes
