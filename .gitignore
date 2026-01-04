@@ -34,3 +34,4 @@ build/
 .flattened-pom.xml
 
 configs
+.DS_Store
