@@ -1,0 +1,36 @@
+# Monitoring Configuration
+
+# Email Settings
+email:
+  smtp_server: "smtp.qiye.aliyun.com"
+  smtp_port: 465
+  username: "service@xx.com"
+  password: "xxxx"
+  sender: "service@xxx.com"
+  use_ssl: true
+  use_tls: false
+  receivers:
+    - "xxx@xxxx.com"
+
+# Global Error Keywords (Regex supported)
+error_keywords:
+  - "OutOfMemoryError"
+  - "Java heap space"
+  - "连接失败或已断开连接"
+  - "重连出错"
+  - "批次消息处理达到限制"
+  - "缓存消息堆积严重"
+  - "线程池队列使用率超过 90%"
+
+# Services to Monitor
+services:
+
+  - name: "notification-server"
+    docker_container_name: "notification-server"
+    log_file_path: "/home/notification/notification-server/logs/error/latest.log"
+
+  - name: "redis"
+    docker_container_name: "redis"
+
+  - name: "rabbitmq"
+    docker_container_name: "rabbitmq"
