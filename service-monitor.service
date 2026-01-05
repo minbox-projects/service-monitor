@@ -3,8 +3,8 @@ Description=Service Monitor Python Script
 After=network.target
 
 [Service]
-WorkingDirectory=/home/huanwei/monitor
-ExecStart=/usr/bin/python3 -u /home/huanwei/monitor/monitor.py /home/huanwei/monitor/configs/config.yaml
+WorkingDirectory=/usr/local/monitor
+ExecStart=/usr/bin/python3 -u /usr/local/monitor/monitor.py /usr/local/monitor/configs/config.yaml
 Restart=always
 User=root
 
