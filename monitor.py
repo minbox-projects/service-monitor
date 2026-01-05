@@ -23,6 +23,11 @@ try:
 except ImportError:
     requests = None
 
+try:
+    import psutil
+except ImportError:
+    psutil = None
+
 def get_host_info():
     hostname = socket.gethostname()
     try:
@@ -407,10 +412,139 @@ class DockerMonitor(threading.Thread):
             
             time.sleep(10) # Check every 10 seconds
 
+class SystemResourceMonitor(threading.Thread):
+    def __init__(self, config, alert_manager):
+        super().__init__()
+        self.config = config.get('system_resources', {})
+        self.alert_manager = alert_manager
+        self.daemon = True
+        self.running = True
+        self.check_interval = self.config.get('check_interval', 60)
+        
+        # Stats for daily report
+        self.stats = {
+            'cpu_usage_samples': [],
+            'net_io_start': None,
+            'net_io_current': None
+        }
+        
+        # CPU Alert tracking
+        self.cpu_high_start_time = None
+        
+        # Initialize network counters
+        if psutil:
+            self.stats['net_io_start'] = psutil.net_io_counters()
+
+    def run(self):
+        if not psutil or not self.config.get('enabled', False):
+            print("SystemResourceMonitor disabled or psutil missing.")
+            return
+
+        print("SystemResourceMonitor started.")
+        while self.running:
+            try:
+                self._check_resources()
+            except Exception as e:
+                print(f"System check error: {e}")
+            time.sleep(self.check_interval)
+
+    def _check_resources(self):
+        # 1. Disk Check
+        disk_cfg = self.config.get('disk', {})
+        if disk_cfg:
+            path = disk_cfg.get('path', '/')
+            try:
+                usage = psutil.disk_usage(path)
+                if usage.percent > disk_cfg.get('alert_threshold', 90):
+                    self.alert_manager.add_alert(
+                        "System Resource Alert",
+                        f"Disk usage on '{path}' is critical: {usage.percent}% (Free: {usage.free / (1024**3):.2f} GB)",
+                        "system-disk"
+                    )
+            except Exception as e:
+                print(f"Disk check failed: {e}")
+
+        # 2. Memory Check
+        mem_cfg = self.config.get('memory', {})
+        if mem_cfg:
+            mem = psutil.virtual_memory()
+            if mem.percent > mem_cfg.get('alert_threshold', 90):
+                 self.alert_manager.add_alert(
+                    "System Resource Alert",
+                    f"Memory usage is critical: {mem.percent}% (Available: {mem.available / (1024**3):.2f} GB)",
+                    "system-memory"
+                )
+
+        # 3. CPU Check
+        cpu_cfg = self.config.get('cpu', {})
+        if cpu_cfg:
+            cpu_percent = psutil.cpu_percent(interval=1)
+            self.stats['cpu_usage_samples'].append(cpu_percent)
+            # Keep only last 24h worth of samples (assuming 60s interval) -> 1440 samples
+            if len(self.stats['cpu_usage_samples']) > 1440:
+                self.stats['cpu_usage_samples'].pop(0)
+
+            threshold = cpu_cfg.get('alert_threshold', 90)
+            duration = cpu_cfg.get('duration_seconds', 300)
+
+            if cpu_percent > threshold:
+                if self.cpu_high_start_time is None:
+                    self.cpu_high_start_time = time.time()
+                elif time.time() - self.cpu_high_start_time > duration:
+                    self.alert_manager.add_alert(
+                        "System Resource Alert",
+                        f"CPU usage high for over {duration}s: {cpu_percent}%",
+                        "system-cpu"
+                    )
+            else:
+                self.cpu_high_start_time = None
+
+        # 4. Network Stats Update
+        self.stats['net_io_current'] = psutil.net_io_counters()
+
+    def get_report_data(self):
+        if not psutil:
+            return ["System Monitor: psutil not installed"]
+
+        lines = ["[Server Health]", "----------------"]
+        
+        # Host info
+        lines.append(f"Hostname : {socket.gethostname()}")
+        
+        # CPU
+        if self.stats['cpu_usage_samples']:
+            avg_cpu = sum(self.stats['cpu_usage_samples']) / len(self.stats['cpu_usage_samples'])
+            max_cpu = max(self.stats['cpu_usage_samples'])
+            core_count = psutil.cpu_count(logical=True)
+            lines.append(f"CPU      : Current: {psutil.cpu_percent()}% ({core_count} Cores) | Avg(24h): {avg_cpu:.1f}% | Peak: {max_cpu:.1f}%")
+        
+        # Memory
+        mem = psutil.virtual_memory()
+        lines.append(f"Memory   : Used: {mem.used / (1024**3):.2f}GB / {mem.total / (1024**3):.2f}GB ({mem.percent}%)")
+        
+        # Disk
+        disk_path = self.config.get('disk', {}).get('path', '/')
+        try:
+            d = psutil.disk_usage(disk_path)
+            lines.append(f"Disk ({disk_path}) : {d.percent}% Used (Free: {d.free / (1024**3):.2f}GB)")
+        except:
+            pass
+
+        # Network
+        if self.stats['net_io_start'] and self.stats['net_io_current']:
+            curr = self.stats['net_io_current']
+            start = self.stats['net_io_start']
+            sent = (curr.bytes_sent - start.bytes_sent) / (1024**3)
+            recv = (curr.bytes_recv - start.bytes_recv) / (1024**3)
+            lines.append(f"Network  : Rx: {recv:.2f}GB | Tx: {sent:.2f}GB (Since start)")
+
+        return lines
+
 class DailySummaryReporter:
-    def __init__(self, config, email_sender):
+    def __init__(self, config, email_sender, system_monitor=None):
         self.services = config.services
         self.email_sender = email_sender
+        self.system_monitor = system_monitor
         try:
             self.docker_client = docker.from_env() if docker else None
         except Exception:
@@ -418,6 +552,11 @@ class DailySummaryReporter:
 
     def send_report(self):
         lines = ["Daily Service Status Summary", "============================"]
+        
+        if self.system_monitor:
+            lines.extend(self.system_monitor.get_report_data())
+            lines.append("") # Empty line
+
         for service in self.services:
             name = service['name']
             lines.append(f"\nService: {name}")
@@ -480,6 +619,10 @@ def main():
         config.aggregation_window
     )
     alert_manager.start()
+    
+    # Initialize System Monitor
+    system_monitor = SystemResourceMonitor(config.data, alert_manager)
+    system_monitor.start()
 
     threads = []
 
@@ -502,7 +645,7 @@ def main():
     threads.append(docker_monitor)
 
     # Setup Scheduled Summaries
-    summary_reporter = DailySummaryReporter(config, email_sender)
+    summary_reporter = DailySummaryReporter(config, email_sender, system_monitor)
     for report_time in config.reporting_times:
         schedule.every().day.at(report_time).do(summary_reporter.send_report)
         print(f"Daily summary scheduled for {report_time}.")
