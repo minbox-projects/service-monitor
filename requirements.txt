@@ -2,3 +2,4 @@ docker
 PyYAML
 schedule
 requests
+psutil
