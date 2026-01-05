@@ -7,6 +7,7 @@ import threading
 import signal
 import sys
 import schedule
+import socket
 from email.mime.text import MIMEText
 from datetime import datetime
 
@@ -16,6 +17,18 @@ try:
 except ImportError:
     docker = None
 
+def get_host_info():
+    hostname = socket.gethostname()
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        # doesn't even have to be reachable
+        s.connect(('10.254.254.254', 1))
+        ip = s.getsockname()[0]
+        s.close()
+    except Exception:
+        ip = '127.0.0.1'
+    return hostname, ip
+
 class Config:
     def __init__(self, config_path):
         with open(config_path, 'r') as f:
@@ -24,12 +37,14 @@ class Config:
         self.email_config = self.data.get('email', {})
         self.services = self.data.get('services', [])
         self.keywords = [re.compile(k) for k in self.data.get('error_keywords', [])]
+        self.reporting_times = self.data.get('reporting', {}).get('times', ['08:00'])
 
 class EmailSender:
     def __init__(self, config):
         self.config = config
         self.last_sent = {} # Key: service_name, Value: timestamp
         self.cooldown = 300 # 5 minutes cooldown between alerts for the same service
+        self.hostname, self.ip = get_host_info()
 
     def send_email(self, subject, body, service_name=None):
         # Check cooldown
@@ -40,7 +55,8 @@ class EmailSender:
                 return
 
         msg = MIMEText(body)
-        msg['Subject'] = f"[ALERT] {subject}" if service_name else f"[INFO] {subject}"
+        subject_prefix = f"[{self.hostname} ({self.ip})]"
+        msg['Subject'] = f"{subject_prefix} [ALERT] {subject}" if service_name else f"{subject_prefix} [INFO] {subject}"
         msg['From'] = self.config['sender']
         msg['To'] = ", ".join(self.config['receivers'])
 
@@ -240,10 +256,11 @@ def main():
     docker_monitor.start()
     threads.append(docker_monitor)
 
-    # Setup Daily Summary
+    # Setup Scheduled Summaries
     summary_reporter = DailySummaryReporter(config, email_sender)
-    schedule.every().day.at("08:00").do(summary_reporter.send_report)
-    print("Daily summary scheduled for 08:00.")
+    for report_time in config.reporting_times:
+        schedule.every().day.at(report_time).do(summary_reporter.send_report)
+        print(f"Daily summary scheduled for {report_time}.")
 
     print("Monitor service started. Press Ctrl+C to stop.")
 
