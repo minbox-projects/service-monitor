@@ -10,18 +10,23 @@ import schedule
 import socket
 from email.mime.text import MIMEText
 from datetime import datetime
+from collections import defaultdict, deque
 
-# Try to import docker, handle if not installed
+# Try imports
 try:
     import docker
 except ImportError:
     docker = None
 
+try:
+    import requests
+except ImportError:
+    requests = None
+
 def get_host_info():
     hostname = socket.gethostname()
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        # doesn't even have to be reachable
         s.connect(('10.254.254.254', 1))
         ip = s.getsockname()[0]
         s.close()
@@ -38,31 +43,26 @@ class Config:
         self.services = self.data.get('services', [])
         self.keywords = [re.compile(k) for k in self.data.get('error_keywords', [])]
         self.reporting_times = self.data.get('reporting', {}).get('times', ['08:00'])
+        
+        # Alert Config
+        alert_cfg = self.data.get('alert_config', {})
+        self.alert_cooldown = alert_cfg.get('cooldown_seconds', 300)
+        self.aggregation_window = alert_cfg.get('aggregation_window', 60)
 
 class EmailSender:
     def __init__(self, config):
         self.config = config
-        self.last_sent = {} # Key: service_name, Value: timestamp
-        self.cooldown = 300 # 5 minutes cooldown between alerts for the same service
         self.hostname, self.ip = get_host_info()
 
-    def send_email(self, subject, body, service_name=None):
-        # Check cooldown
-        if service_name:
-            last = self.last_sent.get(service_name, 0)
-            if time.time() - last < self.cooldown:
-                print(f"[{datetime.now()}] Suppressing alert for {service_name} due to cooldown.")
-                return
-
+    def send_email_immediate(self, subject, body, is_alert=True):
         msg = MIMEText(body)
         subject_prefix = f"[{self.hostname} ({self.ip})]"
-        msg['Subject'] = f"{subject_prefix} [ALERT] {subject}" if service_name else f"{subject_prefix} [INFO] {subject}"
+        msg['Subject'] = f"{subject_prefix} {'[ALERT]' if is_alert else '[INFO]'} {subject}"
         msg['From'] = self.config['sender']
         msg['To'] = ", ".join(self.config['receivers'])
 
         try:
-            print(f"[{datetime.now()}] Sending email {'alert' if service_name else 'notification'} for {service_name if service_name else 'System'}...")
-            
+            print(f"[{datetime.now()}] Sending email: {subject}")
             smtp_server = self.config['smtp_server']
             smtp_port = self.config['smtp_port']
             use_ssl = self.config.get('use_ssl', False)
@@ -76,25 +76,110 @@ class EmailSender:
             with server:
                 if not use_ssl and use_tls:
                     server.starttls()
-                
                 server.login(self.config['username'], self.config['password'])
                 server.sendmail(self.config['sender'], self.config['receivers'], msg.as_string())
-            
             print(f"[{datetime.now()}] Email sent successfully.")
-            if service_name:
-                self.last_sent[service_name] = time.time()
         except Exception as e:
             print(f"Failed to send email: {e}")
 
+class AlertManager(threading.Thread):
+    """
+    Handles alert deduplication, aggregation, and sending.
+    Feature 4: Alert Deduplication and Aggregation
+    """
+    def __init__(self, email_sender, cooldown_seconds=300, aggregation_window=60):
+        super().__init__()
+        self.email_sender = email_sender
+        self.cooldown = cooldown_seconds
+        self.window = aggregation_window
+        self.daemon = True
+        self.running = True
+        
+        self.pending_alerts = [] # List of (subject, message, service_name)
+        self.last_sent = {} # Key: (service_name, alert_type_signature), Value: timestamp
+        self.lock = threading.Lock()
+        self.last_flush_time = time.time()
+
+    def add_alert(self, service_name, subject, message):
+        """Add an alert to be processed."""
+        with self.lock:
+            # Simple signature to identify alert type
+            signature = f"{service_name}:{subject}"
+            now = time.time()
+            
+            # Check cooldown
+            last_time = self.last_sent.get(signature, 0)
+            if now - last_time < self.cooldown:
+                print(f"[{service_name}] Suppressing alert '{subject}' (Cooldown active)")
+                return
+
+            self.pending_alerts.append({
+                'service': service_name,
+                'subject': subject,
+                'message': message,
+                'time': datetime.now().strftime('%H:%M:%S'),
+                'signature': signature
+            })
+            
+    def run(self):
+        while self.running:
+            time.sleep(5)
+            self._check_flush()
+
+    def _check_flush(self):
+        with self.lock:
+            if not self.pending_alerts:
+                return
+            
+            # Check if window passed or critical mass?
+            # For now, strictly follow time window
+            if time.time() - self.last_flush_time < self.window:
+                return
+
+            # Flush alerts
+            print(f"[{datetime.now()}] Flushing {len(self.pending_alerts)} alerts...")
+            
+            # Group by Service
+            grouped_msg = ["Monitor Alerts Report", "====================="]
+            
+            # Update last_sent timestamps
+            for alert in self.pending_alerts:
+                self.last_sent[alert['signature']] = time.time()
+                grouped_msg.append(f"\n[{alert['time']}] Service: {alert['service']}")
+                grouped_msg.append(f"Subject: {alert['subject']}")
+                grouped_msg.append(f"Detail: {alert['message']}")
+                grouped_msg.append("-" * 30)
+
+            full_body = "\n".join(grouped_msg)
+            
+            # Determine subject
+            if len(self.pending_alerts) == 1:
+                subject = f"{self.pending_alerts[0]['service']}: {self.pending_alerts[0]['subject']}"
+            else:
+                subject = f"Multiple Alerts ({len(self.pending_alerts)})"
+
+            self.email_sender.send_email_immediate(subject, full_body, is_alert=True)
+            
+            self.pending_alerts = []
+            self.last_flush_time = time.time()
+
 class LogMonitor(threading.Thread):
-    def __init__(self, service_config, global_keywords, email_sender):
+    def __init__(self, service_config, global_keywords, alert_manager):
         super().__init__()
         self.service_name = service_config['name']
         self.log_path = service_config.get('log_file_path')
         self.keywords = global_keywords
-        self.email_sender = email_sender
+        self.alert_manager = alert_manager
         self.running = True
         self.daemon = True
+        
+        # Enhanced Log Analysis Config
+        self.log_rules = service_config.get('log_rules', {})
+        self.threshold_count = self.log_rules.get('error_threshold_count', 1)
+        self.threshold_window = self.log_rules.get('error_threshold_window', 60)
+        
+        # Store error timestamps
+        self.error_history = deque()
 
     def run(self):
         if not self.log_path:
@@ -102,28 +187,24 @@ class LogMonitor(threading.Thread):
 
         print(f"[{self.service_name}] Starting log monitor for: {self.log_path}")
         
-        # Wait for file to exist
         while not os.path.exists(self.log_path) and self.running:
             time.sleep(5)
         
         if not self.running: return
 
-        # Open file and go to the end
         try:
             with open(self.log_path, 'r', encoding='utf-8', errors='ignore') as f:
-                # Seek to end
                 f.seek(0, 2)
                 
                 while self.running:
                     line = f.readline()
                     if not line:
                         time.sleep(1)
-                        # Check if file was rotated (size became smaller or inode changed - simplified check here)
                         try:
                             if os.stat(self.log_path).st_size < f.tell():
-                                f.seek(0, 0) # File truncated or new file, start from beginning
+                                f.seek(0, 0)
                         except FileNotFoundError:
-                            break # File gone
+                            break
                         continue
                     
                     self.check_line(line)
@@ -133,15 +214,110 @@ class LogMonitor(threading.Thread):
     def check_line(self, line):
         for keyword in self.keywords:
             if keyword.search(line):
-                body = f"Service: {self.service_name}\nDetected error keyword: {keyword.pattern}\n\nLog Line:\n{line.strip()}"
-                self.email_sender.send_email(f"Error detected in {self.service_name}", body, self.service_name)
+                now = time.time()
+                self.error_history.append(now)
+                
+                # Cleanup old errors
+                while self.error_history and self.error_history[0] < now - self.threshold_window:
+                    self.error_history.popleft()
+                
+                # Check threshold
+                if len(self.error_history) >= self.threshold_count:
+                    self.alert_manager.add_alert(
+                        self.service_name,
+                        "Log Error Threshold Exceeded",
+                        f"Keyword: {keyword.pattern}\nMatched {len(self.error_history)} times in {self.threshold_window}s\nLast Line: {line.strip()}"
+                    )
+                    self.error_history.clear() 
                 break
 
+class HealthMonitor(threading.Thread):
+    """
+    Feature 1: HTTP/TCP Health Checks
+    """
+    def __init__(self, service_config, alert_manager):
+        super().__init__()
+        self.service_name = service_config['name']
+        self.config = service_config.get('health_check')
+        self.alert_manager = alert_manager
+        self.running = True
+        self.daemon = True
+
+    def run(self):
+        if not self.config:
+            return
+
+        check_type = self.config.get('type')
+        interval = self.config.get('interval', 30)
+        
+        print(f"[{self.service_name}] Starting {check_type.upper()} health check...")
+
+        while self.running:
+            try:
+                if check_type == 'http':
+                    self.check_http()
+                elif check_type == 'tcp':
+                    self.check_tcp()
+            except Exception as e:
+                self.alert_manager.add_alert(
+                    self.service_name,
+                    f"Health Check Failed ({check_type})",
+                    str(e)
+                )
+            
+            time.sleep(interval)
+
+    def check_http(self):
+        if not requests:
+            return # Skip if no requests lib
+        
+        url = self.config.get('url')
+        timeout = self.config.get('timeout', 5)
+        
+        try:
+            resp = requests.get(url, timeout=timeout)
+            if resp.status_code >= 400:
+                 self.alert_manager.add_alert(
+                    self.service_name,
+                    "HTTP Health Check Failed",
+                    f"URL: {url}\nStatus Code: {resp.status_code}"
+                )
+        except Exception as e:
+             self.alert_manager.add_alert(
+                self.service_name,
+                "HTTP Connection Failed",
+                f"URL: {url}\nError: {str(e)}"
+            )
+
+    def check_tcp(self):
+        host = self.config.get('host', 'localhost')
+        port = self.config.get('port')
+        timeout = self.config.get('timeout', 3)
+        
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(timeout)
+        try:
+            result = sock.connect_ex((host, port))
+            if result != 0:
+                 self.alert_manager.add_alert(
+                    self.service_name,
+                    "TCP Health Check Failed",
+                    f"Host: {host}:{port}\nResult Code: {result} (Not 0)"
+                )
+        except Exception as e:
+            self.alert_manager.add_alert(
+                self.service_name,
+                "TCP Connection Error",
+                str(e)
+            )
+        finally:
+            sock.close()
+
 class DockerMonitor(threading.Thread):
-    def __init__(self, services, email_sender):
+    def __init__(self, services, alert_manager):
         super().__init__()
         self.services = services
-        self.email_sender = email_sender
+        self.alert_manager = alert_manager
         self.running = True
         self.daemon = True
         try:
@@ -149,6 +325,21 @@ class DockerMonitor(threading.Thread):
         except Exception as e:
             print(f"Docker connection failed: {e}")
             self.client = None
+
+    def calculate_cpu_percent(self, stats):
+        try:
+            cpu_delta = stats['cpu_stats']['cpu_usage']['total_usage'] - \
+                        stats['precpu_stats']['cpu_usage']['total_usage']
+            system_delta = stats['cpu_stats']['system_cpu_usage'] - \
+                           stats['precpu_stats']['system_cpu_usage']
+            
+            if system_delta > 0.0 and cpu_delta > 0.0:
+                # Calculate percentage of total system capacity (0-100%)
+                # Removed online_cpus multiplication to normalize across multi-core systems
+                return (cpu_delta / system_delta) * 100.0
+        except KeyError:
+            pass
+        return 0.0
 
     def run(self):
         if not self.client:
@@ -160,25 +351,59 @@ class DockerMonitor(threading.Thread):
         while self.running:
             for service in self.services:
                 container_name = service.get('docker_container_name')
+                metrics_cfg = service.get('metrics', {})
+                
                 if not container_name:
                     continue
 
                 try:
                     container = self.client.containers.get(container_name)
+                    
+                    # 1. Status Check
                     if container.status != 'running':
-                        self.email_sender.send_email(
-                            f"Container {container_name} is DOWN", 
-                            f"The docker container '{container_name}' for service '{service['name']}' is currently '{container.status}'.",
-                            service['name']
+                        self.alert_manager.add_alert(
+                            service['name'],
+                            f"Container Down",
+                            f"Container '{container_name}' status is '{container.status}'"
                         )
+                        continue # Skip metrics if down
+
+                    # 2. Performance Metrics (Feature 2)
+                    if metrics_cfg:
+                        stats = container.stats(stream=False)
+                        
+                        # Memory
+                        mem_usage = stats['memory_stats']['usage']
+                        mem_limit = stats['memory_stats']['limit']
+                        mem_percent = (mem_usage / mem_limit) * 100.0
+                        
+                        mem_threshold = metrics_cfg.get('memory_threshold')
+                        if mem_threshold and mem_percent > mem_threshold:
+                             self.alert_manager.add_alert(
+                                service['name'],
+                                "High Memory Usage",
+                                f"Usage: {mem_percent:.2f}% (Threshold: {mem_threshold}%)"
+                            )
+
+                        # CPU
+                        cpu_percent = self.calculate_cpu_percent(stats)
+                        cpu_threshold = metrics_cfg.get('cpu_threshold')
+                        if cpu_threshold and cpu_percent > cpu_threshold:
+                             self.alert_manager.add_alert(
+                                service['name'],
+                                "High CPU Usage",
+                                f"Usage: {cpu_percent:.2f}% (Threshold: {cpu_threshold}%)"
+                            )
+
                 except docker.errors.NotFound:
-                    self.email_sender.send_email(
-                        f"Container {container_name} MISSING", 
-                        f"The docker container '{container_name}' for service '{service['name']}' could not be found.",
-                        service['name']
-                    )
+                     self.alert_manager.add_alert(
+                            service['name'],
+                            f"Container Missing",
+                            f"Container '{container_name}' not found"
+                        )
                 except Exception as e:
-                    print(f"Error checking container {container_name}: {e}")
+                    # Avoid spamming errors if stats fail occasionaly
+                    print(f"[{service['name']}] Docker check error: {e}")
             
             time.sleep(10) # Check every 10 seconds
 
@@ -213,6 +438,11 @@ class DailySummaryReporter:
                     status = "Docker Client Unavailable"
                 lines.append(f"  Container '{container_name}': {status}")
             
+            # Health Check Status
+            if 'health_check' in service:
+                hc = service['health_check']
+                lines.append(f"  Health Check: Enabled ({hc['type']})")
+
             # Log Status
             log_path = service.get('log_file_path')
             if log_path:
@@ -228,7 +458,7 @@ class DailySummaryReporter:
         
         body = "\n".join(lines)
         print(f"[{datetime.now()}] Sending daily summary...")
-        self.email_sender.send_email("Daily Service Summary", body)
+        self.email_sender.send_email_immediate("Daily Service Summary", body, is_alert=False)
 
 def main():
     if len(sys.argv) > 1:
@@ -242,17 +472,32 @@ def main():
 
     config = Config(config_path)
     email_sender = EmailSender(config.email_config)
+    
+    # Initialize Alert Manager
+    alert_manager = AlertManager(
+        email_sender, 
+        config.alert_cooldown, 
+        config.aggregation_window
+    )
+    alert_manager.start()
 
     threads = []
 
-    # Start Log Monitors
     for service in config.services:
-        t = LogMonitor(service, config.keywords, email_sender)
-        t.start()
-        threads.append(t)
+        # Start Log Monitors
+        if service.get('log_file_path'):
+            t = LogMonitor(service, config.keywords, alert_manager)
+            t.start()
+            threads.append(t)
+        
+        # Start Health Monitors
+        if service.get('health_check'):
+            t = HealthMonitor(service, alert_manager)
+            t.start()
+            threads.append(t)
 
     # Start Docker Monitor
-    docker_monitor = DockerMonitor(config.services, email_sender)
+    docker_monitor = DockerMonitor(config.services, alert_manager)
     docker_monitor.start()
     threads.append(docker_monitor)
 
@@ -266,6 +511,7 @@ def main():
 
     def signal_handler(sig, frame):
         print("\nStopping monitors...")
+        alert_manager.running = False
         for t in threads:
             t.running = False
         sys.exit(0)
