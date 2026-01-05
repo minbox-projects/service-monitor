@@ -8,6 +8,8 @@ import signal
 import sys
 import schedule
 import socket
+import logging
+from logging.handlers import RotatingFileHandler
 from email.mime.text import MIMEText
 from datetime import datetime
 from collections import defaultdict, deque
@@ -27,6 +29,48 @@ try:
     import psutil
 except ImportError:
     psutil = None
+
+def setup_logging(config_data):
+    """Setup global logging based on configuration."""
+    log_cfg = config_data.get('logging', {})
+    if not log_cfg.get('enabled', False):
+        # Basic console logging if disabled
+        logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
+        return
+
+    file_path = log_cfg.get('file_path', 'monitor.log')
+    # Ensure directory exists
+    os.makedirs(os.path.dirname(os.path.abspath(file_path)), exist_ok=True)
+    
+    max_bytes = log_cfg.get('max_bytes', 10 * 1024 * 1024)
+    backup_count = log_cfg.get('backup_count', 5)
+
+    handler = RotatingFileHandler(
+        file_path, 
+        maxBytes=max_bytes, 
+        backupCount=backup_count,
+        encoding='utf-8'
+    )
+    
+    formatter = logging.Formatter('%(asctime)s [%(levelname)s] %(message)s')
+    handler.setFormatter(formatter)
+    
+    # Root logger
+    logger = logging.getLogger()
+    logger.setLevel(logging.INFO)
+    
+    # Clear existing handlers to avoid duplicates
+    if logger.hasHandlers():
+        logger.handlers.clear()
+        
+    logger.addHandler(handler)
+    
+    # Add console handler as well to see output in terminal
+    console_handler = logging.StreamHandler()
+    console_handler.setFormatter(formatter)
+    logger.addHandler(console_handler)
+    
+    logging.info(f"Logging initialized. Writing to: {file_path}")
 
 def get_host_info():
     hostname = socket.gethostname()
@@ -67,7 +111,7 @@ class EmailSender:
         msg['To'] = ", ".join(self.config['receivers'])
 
         try:
-            print(f"[{datetime.now()}] Sending email: {subject}")
+            logging.info(f"Sending email: {subject}")
             smtp_server = self.config['smtp_server']
             smtp_port = self.config['smtp_port']
             use_ssl = self.config.get('use_ssl', False)
@@ -83,9 +127,9 @@ class EmailSender:
                     server.starttls()
                 server.login(self.config['username'], self.config['password'])
                 server.sendmail(self.config['sender'], self.config['receivers'], msg.as_string())
-            print(f"[{datetime.now()}] Email sent successfully.")
+            logging.info("Email sent successfully.")
         except Exception as e:
-            print(f"Failed to send email: {e}")
+            logging.error(f"Failed to send email: {e}")
 
 class AlertManager(threading.Thread):
     """
@@ -115,7 +159,7 @@ class AlertManager(threading.Thread):
             # Check cooldown
             last_time = self.last_sent.get(signature, 0)
             if now - last_time < self.cooldown:
-                print(f"[{service_name}] Suppressing alert '{subject}' (Cooldown active)")
+                logging.info(f"[{service_name}] Suppressing alert '{subject}' (Cooldown active)")
                 return
 
             self.pending_alerts.append({
@@ -142,7 +186,7 @@ class AlertManager(threading.Thread):
                 return
 
             # Flush alerts
-            print(f"[{datetime.now()}] Flushing {len(self.pending_alerts)} alerts...")
+            logging.info(f"Flushing {len(self.pending_alerts)} alerts...")
             
             # Group by Service
             grouped_msg = ["Monitor Alerts Report", "====================="]
@@ -190,7 +234,7 @@ class LogMonitor(threading.Thread):
         if not self.log_path:
             return
 
-        print(f"[{self.service_name}] Starting log monitor for: {self.log_path}")
+        logging.info(f"[{self.service_name}] Starting log monitor for: {self.log_path}")
         
         while not os.path.exists(self.log_path) and self.running:
             time.sleep(5)
@@ -214,7 +258,7 @@ class LogMonitor(threading.Thread):
                     
                     self.check_line(line)
         except Exception as e:
-            print(f"[{self.service_name}] Error reading log: {e}")
+            logging.error(f"[{self.service_name}] Error reading log: {e}")
 
     def check_line(self, line):
         for keyword in self.keywords:
@@ -256,7 +300,7 @@ class HealthMonitor(threading.Thread):
             try:
                 self.docker_client = docker.from_env() if docker else None
             except Exception as e:
-                print(f"[{self.service_name}] Docker client init failed: {e}")
+                logging.error(f"[{self.service_name}] Docker client init failed: {e}")
 
     def run(self):
         # Determine which checks to run
@@ -281,7 +325,7 @@ class HealthMonitor(threading.Thread):
 
         interval = self.config.get('interval', 30)
         check_names = [f.__name__ for f in checks]
-        print(f"[{self.service_name}] Starting checks: {', '.join(check_names)} (Interval: {interval}s)")
+        logging.info(f"[{self.service_name}] Starting checks: {', '.join(check_names)} (Interval: {interval}s)")
 
         while self.running:
             for check_func in checks:
@@ -437,15 +481,15 @@ class SystemResourceMonitor(threading.Thread):
 
     def run(self):
         if not psutil or not self.config.get('enabled', False):
-            print("SystemResourceMonitor disabled or psutil missing.")
+            logging.warning("SystemResourceMonitor disabled or psutil missing.")
             return
 
-        print("SystemResourceMonitor started.")
+        logging.info("SystemResourceMonitor started.")
         while self.running:
             try:
                 self._check_resources()
             except Exception as e:
-                print(f"System check error: {e}")
+                logging.error(f"System check error: {e}")
             time.sleep(self.check_interval)
 
     def _check_resources(self):
@@ -462,7 +506,7 @@ class SystemResourceMonitor(threading.Thread):
                         "system-disk"
                     )
             except Exception as e:
-                print(f"Disk check failed: {e}")
+                logging.error(f"Disk check failed: {e}")
 
         # 2. Memory Check
         mem_cfg = self.config.get('memory', {})
@@ -596,7 +640,7 @@ class DailySummaryReporter:
                     lines.append(f"  Log File: NOT FOUND")
         
         body = "\n".join(lines)
-        print(f"[{datetime.now()}] Sending daily summary...")
+        logging.info("Sending daily summary...")
         self.email_sender.send_email_immediate("Daily Service Summary", body, is_alert=False)
 
 def main():
@@ -606,10 +650,12 @@ def main():
         config_path = 'config.yaml'
         
     if not os.path.exists(config_path):
-        print(f"Config file not found at {config_path}")
+        print(f"Error: Config file not found at {config_path}", file=sys.stderr)
         return
 
     config = Config(config_path)
+    setup_logging(config.data)
+    
     email_sender = EmailSender(config.email_config)
     
     # Initialize Alert Manager
@@ -643,12 +689,12 @@ def main():
     summary_reporter = DailySummaryReporter(config, email_sender, system_monitor)
     for report_time in config.reporting_times:
         schedule.every().day.at(report_time).do(summary_reporter.send_report)
-        print(f"Daily summary scheduled for {report_time}.")
+        logging.info(f"Daily summary scheduled for {report_time}.")
 
-    print("Monitor service started. Press Ctrl+C to stop.")
+    logging.info("Monitor service started. Press Ctrl+C to stop.")
 
     def signal_handler(sig, frame):
-        print("\nStopping monitors...")
+        logging.info("Stopping monitors...")
         alert_manager.running = False
         for t in threads:
             t.running = False
