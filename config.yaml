@@ -12,7 +12,13 @@ email:
   receivers:
     - "xxx@xxxx.com"
 
+# Global Alert Settings
+alert_config:
+  cooldown_seconds: 300       # Cooldown for same alert type
+  aggregation_window: 60      # Wait time to collect alerts before sending (batching)
+
 # Global Error Keywords (Regex supported)
+# These apply if a service doesn't have specific log rules
 error_keywords:
   - "OutOfMemoryError"
   - "Java heap space"
@@ -26,17 +32,39 @@ error_keywords:
 reporting:
   times:
     - "08:00"
-    - "17:00"
+    - "18:00"
 
 # Services to Monitor
 services:
 
   - name: "notification-server"
     docker_container_name: "notification-server"
+    # Feature 2: Performance Metrics
+    metrics:
+      memory_threshold: 80  # %
+      cpu_threshold: 90     # %
+    # Feature 3: Enhanced Log Analysis
     log_file_path: "/home/notification/notification-server/logs/error/latest.log"
+    log_rules:
+      error_threshold_count: 10   # Alert if > 10 errors matched
+      error_threshold_window: 60  # ... in 60 seconds
+
+  - name: "api-server"
+    # Feature 1: Health Check
+    health_check:
+      type: "http"
+      url: "http://localhost:8080/health"
+      timeout: 5
+      interval: 30
 
   - name: "redis"
     docker_container_name: "redis"
+    health_check:
+      type: "tcp"
+      host: "localhost"
+      port: 6379
+      timeout: 3
+      interval: 30
 
   - name: "rabbitmq"
     docker_container_name: "rabbitmq"
