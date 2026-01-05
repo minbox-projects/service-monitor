@@ -31,6 +31,13 @@
    编辑 `config.yaml` 来配置你的环境和服务。
    
    ```yaml
+   # 日志存储设置
+   logging:
+     enabled: true
+     file_path: "./logs/monitor.log"
+     max_bytes: 10485760      # 10MB
+     backup_count: 5          # 保留 5 个备份
+
    # 邮件发送设置
    email:
      smtp_server: "smtp.example.com"
@@ -116,6 +123,11 @@
 
    | 参数路径 (Path) | 说明 (Description) | 默认值 (Default) | 单位 (Unit) |
    | :--- | :--- | :--- | :--- |
+   | **`logging`** | **日志存储配置** | | |
+   | `logging.enabled` | 是否启用日志文件存储 | `false` | - |
+   | `logging.file_path` | 日志文件路径 | `monitor.log` | - |
+   | `logging.max_bytes` | 单个日志文件最大大小 | `10MB` | Bytes |
+   | `logging.backup_count` | 保留的历史日志文件数量 | `5` | 个 |
    | **`email`** | **邮件发送配置** | | |
    | `email.smtp_server` | SMTP 服务器地址 | (Required) | - |
    | `email.smtp_port` | SMTP 端口 | `465` | - |
