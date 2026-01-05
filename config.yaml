@@ -36,9 +36,10 @@ reporting:
 
 # Services to Monitor
 services:
-
   - name: "notification-server"
     docker_container_name: "notification-server"
+    health_check:
+      interval: 10
     # Feature 2: Performance Metrics
     metrics:
       memory_threshold: 80  # %
@@ -68,8 +69,6 @@ services:
 
     - name: "rabbitmq"
       docker_container_name: "rabbitmq"
-
-  
 
   # System Resources Monitoring
   system_resources:
