@@ -239,38 +239,132 @@ class LogMonitor(threading.Thread):
 class HealthMonitor(threading.Thread):
     """
     Feature 1: HTTP/TCP Health Checks
+    Also handles Docker Container checks (Explicitly or Implicitly).
     """
     def __init__(self, service_config, alert_manager):
         super().__init__()
+        self.service_config = service_config
         self.service_name = service_config['name']
-        self.config = service_config.get('health_check')
+        self.config = service_config.get('health_check') or {}
         self.alert_manager = alert_manager
         self.running = True
         self.daemon = True
+        
+        # Docker client setup
+        self.docker_client = None
+        if self.service_config.get('docker_container_name'):
+            try:
+                self.docker_client = docker.from_env() if docker else None
+            except Exception as e:
+                print(f"[{self.service_name}] Docker client init failed: {e}")
 
     def run(self):
-        if not self.config:
+        # Determine which checks to run
+        checks = []
+        check_type = self.config.get('type')
+        
+        # 1. Explicit Health Check
+        if check_type == 'http':
+            checks.append(self.check_http)
+        elif check_type == 'tcp':
+            checks.append(self.check_tcp)
+        elif check_type == 'docker':
+            checks.append(self.check_docker)
+            
+        # 2. Implicit Docker Check
+        # If container name exists, and we haven't already added the docker check
+        if self.service_config.get('docker_container_name') and self.check_docker not in checks:
+            checks.append(self.check_docker)
+
+        if not checks:
             return
 
-        check_type = self.config.get('type')
         interval = self.config.get('interval', 30)
-        
-        print(f"[{self.service_name}] Starting {check_type.upper()} health check...")
+        check_names = [f.__name__ for f in checks]
+        print(f"[{self.service_name}] Starting checks: {', '.join(check_names)} (Interval: {interval}s)")
 
         while self.running:
-            try:
-                if check_type == 'http':
-                    self.check_http()
-                elif check_type == 'tcp':
-                    self.check_tcp()
-            except Exception as e:
-                self.alert_manager.add_alert(
-                    self.service_name,
-                    f"Health Check Failed ({check_type})",
-                    str(e)
-                )
+            for check_func in checks:
+                try:
+                    check_func()
+                except Exception as e:
+                    self.alert_manager.add_alert(
+                        self.service_name,
+                        f"Check Failed",
+                        str(e)
+                    )
             
             time.sleep(interval)
+
+    def calculate_cpu_percent(self, stats):
+        try:
+            cpu_delta = stats['cpu_stats']['cpu_usage']['total_usage'] - \
+                        stats['precpu_stats']['cpu_usage']['total_usage']
+            system_delta = stats['cpu_stats']['system_cpu_usage'] - \
+                           stats['precpu_stats']['system_cpu_usage']
+            
+            if system_delta > 0.0 and cpu_delta > 0.0:
+                return (cpu_delta / system_delta) * 100.0
+        except KeyError:
+            pass
+        return 0.0
+
+    def check_docker(self):
+        if not self.docker_client:
+            self.alert_manager.add_alert(self.service_name, "Docker Check Failed", "Docker client not available")
+            return
+
+        container_name = self.service_config.get('docker_container_name')
+        if not container_name:
+             self.alert_manager.add_alert(self.service_name, "Config Error", "Missing 'docker_container_name'")
+             return
+
+        try:
+            container = self.docker_client.containers.get(container_name)
+            
+            # 1. Status Check
+            if container.status != 'running':
+                self.alert_manager.add_alert(
+                    self.service_name,
+                    f"Container Down",
+                    f"Container '{container_name}' status is '{container.status}'"
+                )
+                return # Skip metrics if down
+
+            # 2. Performance Metrics
+            metrics_cfg = self.service_config.get('metrics', {})
+            if metrics_cfg:
+                stats = container.stats(stream=False)
+                
+                # Memory
+                mem_usage = stats['memory_stats']['usage']
+                mem_limit = stats['memory_stats']['limit']
+                mem_percent = (mem_usage / mem_limit) * 100.0
+                
+                mem_threshold = metrics_cfg.get('memory_threshold')
+                if mem_threshold and mem_percent > mem_threshold:
+                        self.alert_manager.add_alert(
+                        self.service_name,
+                        "High Memory Usage",
+                        f"Usage: {mem_percent:.2f}% (Threshold: {mem_threshold}%)"
+                    )
+
+                # CPU
+                cpu_percent = self.calculate_cpu_percent(stats)
+                cpu_threshold = metrics_cfg.get('cpu_threshold')
+                if cpu_threshold and cpu_percent > cpu_threshold:
+                        self.alert_manager.add_alert(
+                        self.service_name,
+                        "High CPU Usage",
+                        f"Usage: {cpu_percent:.2f}% (Threshold: {cpu_threshold}%)"
+                    )
+
+        except docker.errors.NotFound:
+                self.alert_manager.add_alert(
+                    self.service_name,
+                    f"Container Missing",
+                    f"Container '{container_name}' not found"
+                )
 
     def check_http(self):
         if not requests:
@@ -317,100 +411,6 @@ class HealthMonitor(threading.Thread):
             )
         finally:
             sock.close()
-
-class DockerMonitor(threading.Thread):
-    def __init__(self, services, alert_manager):
-        super().__init__()
-        self.services = services
-        self.alert_manager = alert_manager
-        self.running = True
-        self.daemon = True
-        try:
-            self.client = docker.from_env() if docker else None
-        except Exception as e:
-            print(f"Docker connection failed: {e}")
-            self.client = None
-
-    def calculate_cpu_percent(self, stats):
-        try:
-            cpu_delta = stats['cpu_stats']['cpu_usage']['total_usage'] - \
-                        stats['precpu_stats']['cpu_usage']['total_usage']
-            system_delta = stats['cpu_stats']['system_cpu_usage'] - \
-                           stats['precpu_stats']['system_cpu_usage']
-            
-            if system_delta > 0.0 and cpu_delta > 0.0:
-                # Calculate percentage of total system capacity (0-100%)
-                # Removed online_cpus multiplication to normalize across multi-core systems
-                return (cpu_delta / system_delta) * 100.0
-        except KeyError:
-            pass
-        return 0.0
-
-    def run(self):
-        if not self.client:
-            print("Docker client not available. Skipping container checks.")
-            return
-
-        print("Starting Docker container monitor...")
-        
-        while self.running:
-            for service in self.services:
-                container_name = service.get('docker_container_name')
-                metrics_cfg = service.get('metrics', {})
-                
-                if not container_name:
-                    continue
-
-                try:
-                    container = self.client.containers.get(container_name)
-                    
-                    # 1. Status Check
-                    if container.status != 'running':
-                        self.alert_manager.add_alert(
-                            service['name'],
-                            f"Container Down",
-                            f"Container '{container_name}' status is '{container.status}'"
-                        )
-                        continue # Skip metrics if down
-
-                    # 2. Performance Metrics (Feature 2)
-                    if metrics_cfg:
-                        stats = container.stats(stream=False)
-                        
-                        # Memory
-                        mem_usage = stats['memory_stats']['usage']
-                        mem_limit = stats['memory_stats']['limit']
-                        mem_percent = (mem_usage / mem_limit) * 100.0
-                        
-                        mem_threshold = metrics_cfg.get('memory_threshold')
-                        if mem_threshold and mem_percent > mem_threshold:
-                             self.alert_manager.add_alert(
-                                service['name'],
-                                "High Memory Usage",
-                                f"Usage: {mem_percent:.2f}% (Threshold: {mem_threshold}%)"
-                            )
-
-                        # CPU
-                        cpu_percent = self.calculate_cpu_percent(stats)
-                        cpu_threshold = metrics_cfg.get('cpu_threshold')
-                        if cpu_threshold and cpu_percent > cpu_threshold:
-                             self.alert_manager.add_alert(
-                                service['name'],
-                                "High CPU Usage",
-                                f"Usage: {cpu_percent:.2f}% (Threshold: {cpu_threshold}%)"
-                            )
-
-                except docker.errors.NotFound:
-                     self.alert_manager.add_alert(
-                            service['name'],
-                            f"Container Missing",
-                            f"Container '{container_name}' not found"
-                        )
-                except Exception as e:
-                    # Avoid spamming errors if stats fail occasionaly
-                    print(f"[{service['name']}] Docker check error: {e}")
-            
-            time.sleep(10) # Check every 10 seconds
 
 class SystemResourceMonitor(threading.Thread):
     def __init__(self, config, alert_manager):
@@ -633,16 +633,11 @@ def main():
             t.start()
             threads.append(t)
         
-        # Start Health Monitors
-        if service.get('health_check'):
+        # Start Health Monitors (Explicit or Implicit via Docker)
+        if service.get('health_check') or service.get('docker_container_name'):
             t = HealthMonitor(service, alert_manager)
             t.start()
             threads.append(t)
-
-    # Start Docker Monitor
-    docker_monitor = DockerMonitor(config.services, alert_manager)
-    docker_monitor.start()
-    threads.append(docker_monitor)
 
     # Setup Scheduled Summaries
     summary_reporter = DailySummaryReporter(config, email_sender, system_monitor)
