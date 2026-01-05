@@ -66,5 +66,22 @@ services:
       timeout: 3
       interval: 30
 
-  - name: "rabbitmq"
-    docker_container_name: "rabbitmq"
+    - name: "rabbitmq"
+      docker_container_name: "rabbitmq"
+
+  
+
+  # System Resources Monitoring
+  system_resources:
+    enabled: true
+    check_interval: 60
+    disk:
+      path: "/"
+      alert_threshold: 90 # %
+    memory:
+      alert_threshold: 90 # %
+    cpu:
+      alert_threshold: 90 # %
+      duration_seconds: 300 # Alert if high for 5 mins
+    network:
+      interface: "eth0"
