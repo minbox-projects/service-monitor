@@ -595,53 +595,57 @@ class DailySummaryReporter:
             self.docker_client = None
 
     def send_report(self):
-        lines = ["Daily Service Status Summary", "============================"]
-        
-        if self.system_monitor:
-            lines.extend(self.system_monitor.get_report_data())
-            lines.append("") # Empty line
-
-        for service in self.services:
-            name = service['name']
-            lines.append(f"\nService: {name}")
+        try:
+            lines = ["Daily Service Status Summary", "============================"]
             
-            # Docker Status
-            container_name = service.get('docker_container_name')
-            if container_name:
-                status = "UNKNOWN"
-                if self.docker_client:
-                    try:
-                        container = self.docker_client.containers.get(container_name)
-                        status = container.status.upper()
-                    except docker.errors.NotFound:
-                        status = "MISSING"
-                    except Exception as e:
-                        status = f"ERROR: {str(e)}"
-                else:
-                    status = "Docker Client Unavailable"
-                lines.append(f"  Container '{container_name}': {status}")
-            
-            # Health Check Status
-            if 'health_check' in service:
-                hc = service['health_check']
-                lines.append(f"  Health Check: Enabled ({hc['type']})")
+            if self.system_monitor:
+                lines.extend(self.system_monitor.get_report_data())
+                lines.append("") # Empty line
 
-            # Log Status
-            log_path = service.get('log_file_path')
-            if log_path:
-                if os.path.exists(log_path):
-                    try:
-                        size = os.path.getsize(log_path)
-                        modified = datetime.fromtimestamp(os.path.getmtime(log_path)).strftime('%Y-%m-%d %H:%M:%S')
-                        lines.append(f"  Log File: Exists (Size: {size} bytes, Last Modified: {modified})")
-                    except OSError:
-                        lines.append(f"  Log File: Exists (Cannot read stats)")
-                else:
-                    lines.append(f"  Log File: NOT FOUND")
-        
-        body = "\n".join(lines)
-        logging.info("Sending daily summary...")
-        self.email_sender.send_email_immediate("Daily Service Summary", body, is_alert=False)
+            for service in self.services:
+                name = service['name']
+                lines.append(f"\nService: {name}")
+                
+                # Docker Status
+                container_name = service.get('docker_container_name')
+                if container_name:
+                    status = "UNKNOWN"
+                    if self.docker_client:
+                        try:
+                            container = self.docker_client.containers.get(container_name)
+                            status = container.status.upper()
+                        except docker.errors.NotFound:
+                            status = "MISSING"
+                        except Exception as e:
+                            status = f"ERROR: {str(e)}"
+                    else:
+                        status = "Docker Client Unavailable"
+                    lines.append(f"  Container '{container_name}': {status}")
+                
+                # Health Check Status
+                if 'health_check' in service:
+                    hc = service['health_check']
+                    check_type = hc.get('type', 'Auto/Docker')
+                    lines.append(f"  Health Check: Enabled ({check_type})")
+
+                # Log Status
+                log_path = service.get('log_file_path')
+                if log_path:
+                    if os.path.exists(log_path):
+                        try:
+                            size = os.path.getsize(log_path)
+                            modified = datetime.fromtimestamp(os.path.getmtime(log_path)).strftime('%Y-%m-%d %H:%M:%S')
+                            lines.append(f"  Log File: Exists (Size: {size} bytes, Last Modified: {modified})")
+                        except OSError:
+                            lines.append(f"  Log File: Exists (Cannot read stats)")
+                    else:
+                        lines.append(f"  Log File: NOT FOUND")
+            
+            body = "\n".join(lines)
+            logging.info("Sending daily summary...")
+            self.email_sender.send_email_immediate("Daily Service Summary", body, is_alert=False)
+        except Exception as e:
+            logging.error(f"Failed to generate or send daily report: {e}")
 
 def main():
     if len(sys.argv) > 1:
@@ -704,7 +708,10 @@ def main():
 
     # Keep main thread alive and run schedule
     while True:
-        schedule.run_pending()
+        try:
+            schedule.run_pending()
+        except Exception as e:
+            logging.error(f"Error in scheduled task: {e}")
         time.sleep(1)
 
 if __name__ == "__main__":
