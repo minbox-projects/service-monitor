@@ -22,6 +22,12 @@ error_keywords:
   - "缓存消息堆积严重"
   - "线程池队列使用率超过 90%"
 
+# Scheduled Reporting times
+reporting:
+  times:
+    - "08:00"
+    - "17:00"
+
 # Services to Monitor
 services:
 
