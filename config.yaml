@@ -33,10 +33,15 @@ error_keywords:
   - "Metaspace"
   - "unable to create new native thread"
   - "连接失败或已断开连接"
-  - "重连出错"
-  - "批次消息处理达到限制"
-  - "缓存消息堆积严重"
-  - "线程池队列使用率超过 90%"
+
+# Global Restart Keywords (for services with auto_restart enabled)
+# These will be merged with any service-specific restart keywords
+global_restart_keywords:
+  - "OutOfMemoryError"
+  - "Java heap space"
+  - "GC overhead limit exceeded"
+  - "Metaspace"
+  - "unable to create new native thread"
 
 # Scheduled Reporting times
 reporting:

@@ -58,11 +58,13 @@
    # 全局错误关键字（支持正则，适用于未单独配置 log_rules 的服务）
    error_keywords:
      - "OutOfMemoryError"
-     - "Java heap space"
-     - "GC overhead limit exceeded"
-     - "Metaspace"
-     - "unable to create new native thread"
-     - "Direct buffer memory"
+     - "Connection refused"
+     - "ERROR"
+     - "Exception"
+
+   # 全局重启关键字 (所有开启 auto_restart 的服务都会继承这些规则)
+   global_restart_keywords:
+     - "OutOfMemoryError"
 
    # 定时报告时间 (每日发送摘要)
    reporting:
@@ -110,14 +112,8 @@
          error_threshold_window: 60   # 统计窗口 (秒)
        auto_restart:                  # [可选] 自动重启策略
          enabled: true
-         keywords:                    # [可选] 仅针对 OOM 重启
-           - "OutOfMemoryError"
-           - "Java heap space"
-           - "GC overhead limit exceeded"
-           - "Metaspace"
-           - "unable to create new native thread"
-           - "Direct buffer memory"
-           - "ApiAuthFailed""
+         keywords:                    # [可选] 服务特有的重启关键字 (与全局合并)
+           - "CriticalFailure"
          cooldown: 300                # [可选] 重启冷却时间
 
      # 示例 2: 仅 Docker 监控 (自动推断模式)
@@ -153,6 +149,8 @@
    | **`alert_config`** | **全局告警策略** | | |
    | `alert_config.cooldown_seconds` | 同类告警冷却时间 (避免刷屏) | `300` | 秒 (s) |
    | `alert_config.aggregation_window` | 告警聚合发送窗口 (合并告警) | `60` | 秒 (s) |
+   | `error_keywords` | **全局错误关键字列表** (正则) | `[]` | - |
+   | `global_restart_keywords` | **[New]** 全局重启关键字列表 (对所有开启重启的服务生效) | `[]` | - |
    | **`reporting`** | **定时报告** | | |
    | `reporting.times` | 每日发送摘要的时间点列表 | `["08:00"]` | HH:MM |
    | **`services`** | **服务监控 (列表项)** | | |
@@ -224,16 +222,17 @@
     *   只要日志行匹配该集合中 **任意** 一个关键字，就会被计入错误并发送告警。
 
 2.  **第二级：重启关键字 (Restart Filter)**
-    *   当错误被捕获后，程序会进一步检查该行是否匹配 `auto_restart.keywords`。
-    *   **逻辑**：只有当日志行 **同时** 属于“监控集合”且匹配 `auto_restart.keywords` 时，才会触发自动重启。
+    *   当错误被捕获后，程序会进一步检查该行是否匹配 **重启关键字集合**。
+    *   **集合构成**：`全局重启关键字 (global_restart_keywords) U 服务重启关键字 (auto_restart.keywords)`
+    *   **逻辑**：只有当日志行 **同时** 属于“监控集合”且匹配“重启关键字集合”时，才会触发自动重启。
 
 **场景示例：**
-*   **全局配置**：`["OutOfMemory"]`
+*   **全局配置**：`error_keywords: ["OutOfMemory"]`, `global_restart_keywords: ["OutOfMemory"]`
 *   **服务A 配置**：`error_keywords: ["Timeout"]`, `auto_restart.keywords: ["Timeout"]`
 
 **结果：**
-*   遇到 `OutOfMemory` -> 触发全局规则 -> **报警** (不重启，因为不在服务A的restart列表)
-*   遇到 `Timeout` -> 触发服务A规则 -> **报警** -> 匹配重启列表 -> **报警并重启**
+*   遇到 `OutOfMemory` -> 触发全局规则 -> **报警** -> 匹配全局重启列表 -> **报警并重启**
+*   遇到 `Timeout` -> 触发服务A规则 -> **报警** -> 匹配服务A重启列表 -> **报警并重启**
 *   遇到 `Exception` -> 不在任何列表 -> **忽略**
 
 ## 自动重启功能限制
