@@ -136,11 +136,12 @@ class AlertManager(threading.Thread):
     Handles alert deduplication, aggregation, and sending.
     Feature 4: Alert Deduplication and Aggregation
     """
-    def __init__(self, email_sender, cooldown_seconds=300, aggregation_window=60):
+    def __init__(self, email_sender, cooldown_seconds=300, aggregation_window=60, service_map=None):
         super().__init__()
         self.email_sender = email_sender
         self.cooldown = cooldown_seconds
         self.window = aggregation_window
+        self.service_map = service_map or {}
         self.daemon = True
         self.running = True
         
@@ -194,7 +195,14 @@ class AlertManager(threading.Thread):
             # Update last_sent timestamps
             for alert in self.pending_alerts:
                 self.last_sent[alert['signature']] = time.time()
-                grouped_msg.append(f"\n[{alert['time']}] Service: {alert['service']}")
+                service_name = alert['service']
+                grouped_msg.append(f"\n[{alert['time']}] Service: {service_name}")
+                
+                if service_name in self.service_map:
+                    log_path = self.service_map[service_name].get('log_file_path')
+                    if log_path:
+                        grouped_msg.append(f"Log File: {log_path}")
+                
                 grouped_msg.append(f"Subject: {alert['subject']}")
                 grouped_msg.append(f"Detail: {alert['message']}")
                 grouped_msg.append("-" * 30)
@@ -217,16 +225,39 @@ class LogMonitor(threading.Thread):
         super().__init__()
         self.service_name = service_config['name']
         self.log_path = service_config.get('log_file_path')
-        self.keywords = global_keywords
         self.alert_manager = alert_manager
         self.running = True
         self.daemon = True
+        
+        # Merge global keywords with service-specific keywords
+        self.keywords = list(global_keywords) # Copy global list
+        service_specific_keywords = service_config.get('error_keywords', [])
+        for k in service_specific_keywords:
+            try:
+                self.keywords.append(re.compile(k))
+            except re.error as e:
+                logging.error(f"[{self.service_name}] Invalid regex in service keywords '{k}': {e}")
         
         # Enhanced Log Analysis Config
         self.log_rules = service_config.get('log_rules', {})
         self.threshold_count = self.log_rules.get('error_threshold_count', 1)
         self.threshold_window = self.log_rules.get('error_threshold_window', 60)
         
+        # Auto Restart Config
+        restart_cfg = service_config.get('auto_restart', {})
+        self.auto_restart = restart_cfg.get('enabled', False)
+        self.restart_cooldown = restart_cfg.get('cooldown', 300)
+        self.restart_keywords = [re.compile(k) for k in restart_cfg.get('keywords', [])]
+        self.last_restart_time = 0
+        self.container_name = service_config.get('docker_container_name')
+        
+        self.docker_client = None
+        if self.auto_restart and self.container_name and docker:
+            try:
+                self.docker_client = docker.from_env()
+            except Exception as e:
+                logging.error(f"[{self.service_name}] Failed to init Docker client for auto-restart: {e}")
+
         # Store error timestamps
         self.error_history = deque()
 
@@ -277,8 +308,52 @@ class LogMonitor(threading.Thread):
                         "Log Error Threshold Exceeded",
                         f"Keyword: {keyword.pattern}\nMatched {len(self.error_history)} times in {self.threshold_window}s\nLast Line: {line.strip()}"
                     )
+                    
+                    if self.auto_restart:
+                        should_restart = False
+                        if self.restart_keywords:
+                            # If specific keywords defined, only restart if one matches the current line
+                            for rk in self.restart_keywords:
+                                if rk.search(line):
+                                    should_restart = True
+                                    break
+                        else:
+                            # Fallback: Restart on any error if no specific keywords defined
+                            should_restart = True
+
+                        if should_restart:
+                            self.trigger_restart(keyword.pattern)
+
                     self.error_history.clear() 
                 break
+
+    def trigger_restart(self, reason):
+        if not self.docker_client or not self.container_name:
+            return
+            
+        now = time.time()
+        if now - self.last_restart_time < self.restart_cooldown:
+            logging.info(f"[{self.service_name}] Skipping auto-restart (Cooldown active)")
+            return
+
+        try:
+            logging.info(f"[{self.service_name}] Triggering AUTO-RESTART due to: {reason}")
+            container = self.docker_client.containers.get(self.container_name)
+            container.restart()
+            self.last_restart_time = now
+            
+            self.alert_manager.add_alert(
+                self.service_name,
+                "CRITICAL: Service Auto-Restarted",
+                f"Container '{self.container_name}' was restarted automatically.\nReason: Log keyword match '{reason}'"
+            )
+        except Exception as e:
+            logging.error(f"[{self.service_name}] Auto-restart failed: {e}")
+            self.alert_manager.add_alert(
+                self.service_name,
+                "Auto-Restart FAILED",
+                f"Attempted to restart '{self.container_name}' but failed: {e}"
+            )
 
 class HealthMonitor(threading.Thread):
     """
@@ -635,11 +710,11 @@ class DailySummaryReporter:
                         try:
                             size = os.path.getsize(log_path)
                             modified = datetime.fromtimestamp(os.path.getmtime(log_path)).strftime('%Y-%m-%d %H:%M:%S')
-                            lines.append(f"  Log File: Exists (Size: {size} bytes, Last Modified: {modified})")
+                            lines.append(f"  Log File: {log_path} (Size: {size} bytes, Last Modified: {modified})")
                         except OSError:
-                            lines.append(f"  Log File: Exists (Cannot read stats)")
+                            lines.append(f"  Log File: {log_path} (Cannot read stats)")
                     else:
-                        lines.append(f"  Log File: NOT FOUND")
+                        lines.append(f"  Log File: {log_path} (NOT FOUND)")
             
             body = "\n".join(lines)
             logging.info("Sending daily summary...")
@@ -663,10 +738,12 @@ def main():
     email_sender = EmailSender(config.email_config)
     
     # Initialize Alert Manager
+    service_map = {s['name']: s for s in config.services}
     alert_manager = AlertManager(
         email_sender, 
         config.alert_cooldown, 
-        config.aggregation_window
+        config.aggregation_window,
+        service_map
     )
     alert_manager.start()
     
