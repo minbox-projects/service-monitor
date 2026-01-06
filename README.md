@@ -58,9 +58,11 @@
    # 全局错误关键字（支持正则，适用于未单独配置 log_rules 的服务）
    error_keywords:
      - "OutOfMemoryError"
-     - "Connection refused"
-     - "ERROR"
-     - "Exception"
+     - "Java heap space"
+     - "GC overhead limit exceeded"
+     - "Metaspace"
+     - "unable to create new native thread"
+     - "Direct buffer memory"
 
    # 定时报告时间 (每日发送摘要)
    reporting:
@@ -100,9 +102,23 @@
          interval: 30             # 检查间隔 (秒)
        # 日志监控
        log_file_path: "/var/log/api/error.log"
+       error_keywords:                # [可选] 该服务特有的错误关键字 (与全局关键字合并)
+         - "ApiAuthFailed"
+         - "DatabaseDeadlock"
        log_rules:
          error_threshold_count: 5     # 触发告警的最小错误数
          error_threshold_window: 60   # 统计窗口 (秒)
+       auto_restart:                  # [可选] 自动重启策略
+         enabled: true
+         keywords:                    # [可选] 仅针对 OOM 重启
+           - "OutOfMemoryError"
+           - "Java heap space"
+           - "GC overhead limit exceeded"
+           - "Metaspace"
+           - "unable to create new native thread"
+           - "Direct buffer memory"
+           - "ApiAuthFailed""
+         cooldown: 300                # [可选] 重启冷却时间
 
      # 示例 2: 仅 Docker 监控 (自动推断模式)
      - name: "worker-node"
@@ -151,8 +167,12 @@
    | `services[].health_check.port` | TCP 检查端口 | - | - |
    | `services[].health_check.timeout` | 请求超时时间 | `5` (HTTP), `3` (TCP) | 秒 (s) |
    | `services[].log_file_path` | 需监控的日志文件绝对路径 | - | - |
+   | `services[].error_keywords` | **[New]** 服务特有的错误关键字列表 (与全局合并) | `[]` | - |
    | `services[].log_rules.error_threshold_count` | 日志告警触发的最小错误次数 | `1` | 次 |
    | `services[].log_rules.error_threshold_window` | 日志错误计数的滑动窗口 | `60` | 秒 (s) |
+   | `services[].auto_restart.enabled` | **[New]** 是否启用自动重启 | `false` | - |
+   | `services[].auto_restart.keywords` | **[New]** 仅针对匹配这些正则的错误才重启 | `[]` (全部) | - |
+   | `services[].auto_restart.cooldown` | **[New]** 自动重启的冷却时间 | `300` | 秒 (s) |
    | **`system_resources`** | **宿主机资源监控** | | |
    | `system_resources.enabled` | 是否开启系统资源监控 | `false` | - |
    | `system_resources.check_interval` | 资源检查间隔 | `60` | 秒 (s) |
@@ -194,3 +214,51 @@
 ## 告警聚合与去重
 - **去重**：如果触发了一个告警（例如“容器宕机”），在 `cooldown_seconds`（默认 5 分钟）内不会再次为同一服务发送相同的告警。
 - **聚合**：如果在 `aggregation_window`（默认 60 秒）内发生了 10 个错误（可能跨多个服务），你将收到**一封**包含所有错误详情的汇总邮件，而不是 10 封单独的邮件。
+
+## 日志监控关键字关系说明
+日志监控采用组合与过滤逻辑：
+
+1.  **第一级：监控关键字集合 (Monitor Set)**
+    *   程序会合并 **全局配置** (`error_keywords`) 和 **服务单独配置** (`services[].error_keywords`) 的关键字。
+    *   **逻辑**：`监控集合 = 全局关键字 U 服务关键字`
+    *   只要日志行匹配该集合中 **任意** 一个关键字，就会被计入错误并发送告警。
+
+2.  **第二级：重启关键字 (Restart Filter)**
+    *   当错误被捕获后，程序会进一步检查该行是否匹配 `auto_restart.keywords`。
+    *   **逻辑**：只有当日志行 **同时** 属于“监控集合”且匹配 `auto_restart.keywords` 时，才会触发自动重启。
+
+**场景示例：**
+*   **全局配置**：`["OutOfMemory"]`
+*   **服务A 配置**：`error_keywords: ["Timeout"]`, `auto_restart.keywords: ["Timeout"]`
+
+**结果：**
+*   遇到 `OutOfMemory` -> 触发全局规则 -> **报警** (不重启，因为不在服务A的restart列表)
+*   遇到 `Timeout` -> 触发服务A规则 -> **报警** -> 匹配重启列表 -> **报警并重启**
+*   遇到 `Exception` -> 不在任何列表 -> **忽略**
+
+## 自动重启功能限制
+**自动重启 (Auto-Restart) 功能仅适用于 Docker 部署的服务。**
+
+*   **生效条件**：服务配置中必须包含 `docker_container_name` 字段。
+*   **适用场景**：通过日志监控发现错误（如 OOM）时触发重启。
+*   **不适用场景**：
+    *   纯 TCP/HTTP 监控（未绑定 Docker 容器的服务）。
+    *   健康检查（Health Check）失败（目前仅发送告警，不自动重启）。
+
+## 注意事项 (Important Notes)
+
+1.  **Docker 权限**
+    *   运行此脚本的用户需要具有访问 Docker Daemon 的权限。
+    *   **宿主机运行**：通常需要用户属于 `docker` 组。
+    *   **容器内运行**：必须将宿主机的 `/var/run/docker.sock` 挂载到容器中。
+
+2.  **日志轮转 (Log Rotation)**
+    *   本工具支持 `copytruncate`（复制并截断）模式的日志轮转，或文件内容不断追加的模式。
+    *   **不完全支持**传统的 `move/create`（重命名后新建）模式。如果日志文件被移动且创建了新文件，监控程序可能无法自动切换到新文件，建议配置 Logrotate 使用 `copytruncate` 选项。
+
+3.  **启动即时性**
+    *   程序启动时会自动跳到日志文件的**末尾**开始监控。
+    *   这意味着启动**之前**产生的历史错误日志不会被检测到，监控仅针对启动后新产生的日志。
+
+4.  **配置更新**
+    *   配置文件仅在程序启动时读取一次。如果修改了 `config.yaml`，请务必**重启**监控进程以使配置生效。

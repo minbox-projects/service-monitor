@@ -29,6 +29,9 @@ alert_config:
 error_keywords:
   - "OutOfMemoryError"
   - "Java heap space"
+  - "GC overhead limit exceeded"
+  - "Metaspace"
+  - "unable to create new native thread"
   - "连接失败或已断开连接"
   - "重连出错"
   - "批次消息处理达到限制"
@@ -56,6 +59,12 @@ services:
     log_rules:
       error_threshold_count: 10   # Alert if > 10 errors matched
       error_threshold_window: 60  # ... in 60 seconds
+      # Auto-Restart Config
+      auto_restart: true          # Automatically restart docker container on error threshold
+      restart_keywords:
+        - "OutOfMemoryError"
+        - "Java heap space"
+      restart_cooldown: 300       # Wait at least 5 mins between restarts
 
   - name: "api-server"
     # Feature 1: Health Check
