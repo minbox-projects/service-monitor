@@ -91,6 +91,7 @@ class Config:
         self.email_config = self.data.get('email', {})
         self.services = self.data.get('services', [])
         self.keywords = [re.compile(k) for k in self.data.get('error_keywords', [])]
+        self.restart_keywords = [re.compile(k) for k in self.data.get('global_restart_keywords', [])]
         self.reporting_times = self.data.get('reporting', {}).get('times', ['08:00'])
         
         # Alert Config
@@ -221,7 +222,7 @@ class AlertManager(threading.Thread):
             self.last_flush_time = time.time()
 
 class LogMonitor(threading.Thread):
-    def __init__(self, service_config, global_keywords, alert_manager):
+    def __init__(self, service_config, global_keywords, global_restart_keywords, alert_manager):
         super().__init__()
         self.service_name = service_config['name']
         self.log_path = service_config.get('log_file_path')
@@ -247,7 +248,15 @@ class LogMonitor(threading.Thread):
         restart_cfg = service_config.get('auto_restart', {})
         self.auto_restart = restart_cfg.get('enabled', False)
         self.restart_cooldown = restart_cfg.get('cooldown', 300)
-        self.restart_keywords = [re.compile(k) for k in restart_cfg.get('keywords', [])]
+        
+        # Merge global and local restart keywords
+        self.restart_keywords = list(global_restart_keywords)
+        for k in restart_cfg.get('keywords', []):
+            try:
+                self.restart_keywords.append(re.compile(k))
+            except re.error as e:
+                logging.error(f"[{self.service_name}] Invalid regex in auto_restart keywords '{k}': {e}")
+             
         self.last_restart_time = 0
         self.container_name = service_config.get('docker_container_name')
         
@@ -756,7 +765,7 @@ def main():
     for service in config.services:
         # Start Log Monitors
         if service.get('log_file_path'):
-            t = LogMonitor(service, config.keywords, alert_manager)
+            t = LogMonitor(service, config.keywords, config.restart_keywords, alert_manager)
             t.start()
             threads.append(t)
         
