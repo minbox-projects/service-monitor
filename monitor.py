@@ -356,6 +356,10 @@ class LogMonitor(threading.Thread):
                 "CRITICAL: Service Auto-Restarted",
                 f"Container '{self.container_name}' was restarted automatically.\nReason: Log keyword match '{reason}'"
             )
+
+            # Start recovery check
+            threading.Thread(target=self.wait_for_recovery, args=(self.container_name,), daemon=True).start()
+
         except Exception as e:
             logging.error(f"[{self.service_name}] Auto-restart failed: {e}")
             self.alert_manager.add_alert(
@@ -363,6 +367,32 @@ class LogMonitor(threading.Thread):
                 "Auto-Restart FAILED",
                 f"Attempted to restart '{self.container_name}' but failed: {e}"
             )
+
+    def wait_for_recovery(self, container_name):
+        """Waits for the container to become running and sends a notification."""
+        logging.info(f"[{self.service_name}] Waiting for recovery...")
+        # Check for up to 5 minutes
+        max_retries = 30  
+        retry_interval = 10
+        
+        for _ in range(max_retries):
+            time.sleep(retry_interval)
+            try:
+                container = self.docker_client.containers.get(container_name)
+                # Refresh container state
+                container.reload()
+                if container.status == 'running':
+                    self.alert_manager.add_alert(
+                        self.service_name,
+                        "RECOVERY: Service Restarted Successfully",
+                        f"Container '{container_name}' is back to 'running' state after auto-restart."
+                    )
+                    logging.info(f"[{self.service_name}] Recovery detected and notified.")
+                    return
+            except Exception as e:
+                logging.warning(f"[{self.service_name}] Error checking recovery status: {e}")
+        
+        logging.error(f"[{self.service_name}] Recovery check timed out (Container not running after 5m).")
 
 class HealthMonitor(threading.Thread):
     """
