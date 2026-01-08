@@ -454,6 +454,16 @@ class HealthMonitor(threading.Thread):
                 self.docker_client = docker.from_env() if docker else None
             except Exception as e:
                 logging.error(f"[{self.service_name}] Docker client init failed: {e}")
+        
+        # Auto Restart Config
+        restart_cfg = service_config.get('auto_restart', {})
+        self.auto_restart = restart_cfg.get('enabled', False)
+        try:
+            self.restart_cooldown = int(restart_cfg.get('cooldown', 300))
+        except (ValueError, TypeError):
+            self.restart_cooldown = 300
+        
+        self.last_restart_time = 0
 
     def run(self):
         # Determine which checks to run
@@ -521,11 +531,20 @@ class HealthMonitor(threading.Thread):
             
             # 1. Status Check
             if container.status != 'running':
+                # If currently restarting, just log and skip
+                if container.status == 'restarting':
+                    logging.info(f"[{self.service_name}] Container is currently restarting. Skipping checks.")
+                    return
+
                 self.alert_manager.add_alert(
                     self.service_name,
                     f"Container Down",
                     f"Container '{container_name}' status is '{container.status}'"
                 )
+                
+                if self.auto_restart:
+                    self.trigger_restart(container_name, container.status)
+                    
                 return # Skip metrics if down
 
             # 2. Performance Metrics
@@ -608,6 +627,73 @@ class HealthMonitor(threading.Thread):
             )
         finally:
             sock.close()
+
+    def trigger_restart(self, container_name, current_status):
+        now = time.time()
+        if now - self.last_restart_time < self.restart_cooldown:
+            logging.info(f"[{self.service_name}] Skipping health-check auto-restart (Cooldown active)")
+            return
+
+        try:
+            logging.info(f"[{self.service_name}] Triggering AUTO-RESTART due to status: {current_status}")
+            container = self.docker_client.containers.get(container_name)
+            container.restart()
+            self.last_restart_time = now
+            
+            self.alert_manager.add_alert(
+                self.service_name,
+                "CRITICAL: Service Auto-Restarted (Health Check)",
+                f"Container '{container_name}' was found in '{current_status}' state and restarted.",
+                immediate=True
+            )
+
+            # Start recovery check
+            threading.Thread(target=self.wait_for_recovery, args=(container_name,), daemon=True).start()
+
+        except Exception as e:
+            logging.error(f"[{self.service_name}] Health-check auto-restart failed: {e}")
+            self.alert_manager.add_alert(
+                self.service_name,
+                "Auto-Restart FAILED",
+                f"Attempted to restart '{container_name}' but failed: {e}"
+            )
+
+    def wait_for_recovery(self, container_name):
+        """Waits for the container to become running and sends a notification."""
+        logging.info(f"[{self.service_name}] Waiting for recovery...")
+        
+        # Create a local docker client to avoid thread safety issues
+        local_docker = None
+        if docker:
+            try:
+                local_docker = docker.from_env()
+            except Exception as e:
+                logging.error(f"[{self.service_name}] Failed to create local docker client for recovery check: {e}")
+                return
+
+        # Check for up to 5 minutes
+        max_retries = 30  
+        retry_interval = 10
+        
+        for _ in range(max_retries):
+            time.sleep(retry_interval)
+            try:
+                container = local_docker.containers.get(container_name)
+                # Refresh container state
+                container.reload()
+                if container.status == 'running':
+                    self.alert_manager.add_alert(
+                        self.service_name,
+                        "RECOVERY: Service Restarted Successfully",
+                        f"Container '{container_name}' is back to 'running' state after health-check restart.",
+                        immediate=True
+                    )
+                    logging.info(f"[{self.service_name}] Recovery detected and notified.")
+                    return
+            except Exception as e:
+                logging.warning(f"[{self.service_name}] Error checking recovery status: {e}")
+        
+        logging.error(f"[{self.service_name}] Recovery check timed out (Container not running after 5m).")
 
 class SystemResourceMonitor(threading.Thread):
     def __init__(self, config, alert_manager):
