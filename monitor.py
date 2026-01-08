@@ -105,14 +105,23 @@ class EmailSender:
         self.hostname, self.ip = get_host_info()
 
     def send_email_immediate(self, subject, body, is_alert=True):
-        msg = MIMEText(body)
+        msg = MIMEText(body, 'plain', 'utf-8')
         subject_prefix = f"[{self.hostname} ({self.ip})]"
         msg['Subject'] = f"{subject_prefix} {'[ALERT]' if is_alert else '[INFO]'} {subject}"
         msg['From'] = self.config['sender']
-        msg['To'] = ", ".join(self.config['receivers'])
+        
+        # Ensure receivers is a list of strings
+        receivers = self.config['receivers']
+        if isinstance(receivers, str):
+            receivers = [receivers]
+        msg['To'] = ", ".join(receivers)
+        
+        # Add standard headers to reduce spam classification
+        msg['Date'] = datetime.now().strftime('%a, %d %b %Y %H:%M:%S %z')
+        msg['Message-ID'] = f"<{datetime.now().timestamp()}@{self.hostname}>"
 
         try:
-            logging.info(f"Sending email: {subject}")
+            logging.info(f"Sending email: {subject} to {receivers}")
             smtp_server = self.config['smtp_server']
             smtp_port = self.config['smtp_port']
             use_ssl = self.config.get('use_ssl', False)
@@ -127,7 +136,7 @@ class EmailSender:
                 if not use_ssl and use_tls:
                     server.starttls()
                 server.login(self.config['username'], self.config['password'])
-                server.sendmail(self.config['sender'], self.config['receivers'], msg.as_string())
+                server.sendmail(self.config['sender'], receivers, msg.as_string())
             logging.info("Email sent successfully.")
         except Exception as e:
             logging.error(f"Failed to send email: {e}")
