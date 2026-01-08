@@ -151,7 +151,7 @@ class AlertManager(threading.Thread):
         self.lock = threading.Lock()
         self.last_flush_time = time.time()
 
-    def add_alert(self, service_name, subject, message):
+    def add_alert(self, service_name, subject, message, immediate=False):
         """Add an alert to be processed."""
         with self.lock:
             # Simple signature to identify alert type
@@ -172,6 +172,10 @@ class AlertManager(threading.Thread):
                 'signature': signature
             })
             
+            if immediate:
+                logging.info(f"[{service_name}] Immediate flush requested for: {subject}")
+                self._flush_pending()
+            
     def run(self):
         while self.running:
             time.sleep(5)
@@ -187,39 +191,46 @@ class AlertManager(threading.Thread):
             if time.time() - self.last_flush_time < self.window:
                 return
 
-            # Flush alerts
-            logging.info(f"Flushing {len(self.pending_alerts)} alerts...")
-            
-            # Group by Service
-            grouped_msg = ["Monitor Alerts Report", "====================="]
-            
-            # Update last_sent timestamps
-            for alert in self.pending_alerts:
-                self.last_sent[alert['signature']] = time.time()
-                service_name = alert['service']
-                grouped_msg.append(f"\n[{alert['time']}] Service: {service_name}")
-                
-                if service_name in self.service_map:
-                    log_path = self.service_map[service_name].get('log_file_path')
-                    if log_path:
-                        grouped_msg.append(f"Log File: {log_path}")
-                
-                grouped_msg.append(f"Subject: {alert['subject']}")
-                grouped_msg.append(f"Detail: {alert['message']}")
-                grouped_msg.append("-" * 30)
+            self._flush_pending()
 
-            full_body = "\n".join(grouped_msg)
-            
-            # Determine subject
-            if len(self.pending_alerts) == 1:
-                subject = f"{self.pending_alerts[0]['service']}: {self.pending_alerts[0]['subject']}"
-            else:
-                subject = f"Multiple Alerts ({len(self.pending_alerts)})"
+    def _flush_pending(self):
+        # NOTE: This method must be called with self.lock held
+        if not self.pending_alerts:
+            return
 
-            self.email_sender.send_email_immediate(subject, full_body, is_alert=True)
+        # Flush alerts
+        logging.info(f"Flushing {len(self.pending_alerts)} alerts...")
+        
+        # Group by Service
+        grouped_msg = ["Monitor Alerts Report", "====================="]
+        
+        # Update last_sent timestamps
+        for alert in self.pending_alerts:
+            self.last_sent[alert['signature']] = time.time()
+            service_name = alert['service']
+            grouped_msg.append(f"\n[{alert['time']}] Service: {service_name}")
             
-            self.pending_alerts = []
-            self.last_flush_time = time.time()
+            if service_name in self.service_map:
+                log_path = self.service_map[service_name].get('log_file_path')
+                if log_path:
+                    grouped_msg.append(f"Log File: {log_path}")
+            
+            grouped_msg.append(f"Subject: {alert['subject']}")
+            grouped_msg.append(f"Detail: {alert['message']}")
+            grouped_msg.append("-" * 30)
+
+        full_body = "\n".join(grouped_msg)
+        
+        # Determine subject
+        if len(self.pending_alerts) == 1:
+            subject = f"{self.pending_alerts[0]['service']}: {self.pending_alerts[0]['subject']}"
+        else:
+            subject = f"Multiple Alerts ({len(self.pending_alerts)})"
+
+        self.email_sender.send_email_immediate(subject, full_body, is_alert=True)
+        
+        self.pending_alerts = []
+        self.last_flush_time = time.time()
 
 class LogMonitor(threading.Thread):
     def __init__(self, service_config, global_keywords, global_restart_keywords, alert_manager):
@@ -354,7 +365,8 @@ class LogMonitor(threading.Thread):
             self.alert_manager.add_alert(
                 self.service_name,
                 "CRITICAL: Service Auto-Restarted",
-                f"Container '{self.container_name}' was restarted automatically.\nReason: Log keyword match '{reason}'"
+                f"Container '{self.container_name}' was restarted automatically.\nReason: Log keyword match '{reason}'",
+                immediate=True
             )
 
             # Start recovery check
@@ -371,6 +383,16 @@ class LogMonitor(threading.Thread):
     def wait_for_recovery(self, container_name):
         """Waits for the container to become running and sends a notification."""
         logging.info(f"[{self.service_name}] Waiting for recovery...")
+        
+        # Create a local docker client to avoid thread safety issues
+        local_docker = None
+        if docker:
+            try:
+                local_docker = docker.from_env()
+            except Exception as e:
+                logging.error(f"[{self.service_name}] Failed to create local docker client for recovery check: {e}")
+                return
+
         # Check for up to 5 minutes
         max_retries = 30  
         retry_interval = 10
@@ -378,14 +400,15 @@ class LogMonitor(threading.Thread):
         for _ in range(max_retries):
             time.sleep(retry_interval)
             try:
-                container = self.docker_client.containers.get(container_name)
+                container = local_docker.containers.get(container_name)
                 # Refresh container state
                 container.reload()
                 if container.status == 'running':
                     self.alert_manager.add_alert(
                         self.service_name,
                         "RECOVERY: Service Restarted Successfully",
-                        f"Container '{container_name}' is back to 'running' state after auto-restart."
+                        f"Container '{container_name}' is back to 'running' state after auto-restart.",
+                        immediate=True
                     )
                     logging.info(f"[{self.service_name}] Recovery detected and notified.")
                     return
