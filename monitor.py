@@ -267,7 +267,11 @@ class LogMonitor(threading.Thread):
         # Auto Restart Config
         restart_cfg = service_config.get('auto_restart', {})
         self.auto_restart = restart_cfg.get('enabled', False)
-        self.restart_cooldown = restart_cfg.get('cooldown', 300)
+        try:
+            self.restart_cooldown = int(restart_cfg.get('cooldown', 300))
+        except (ValueError, TypeError):
+            self.restart_cooldown = 300
+            logging.warning(f"[{self.service_name}] Invalid restart cooldown config, defaulting to 300s")
         
         # Merge global and local restart keywords
         self.restart_keywords = list(global_restart_keywords)
@@ -346,6 +350,9 @@ class LogMonitor(threading.Thread):
                                 if rk.search(line):
                                     should_restart = True
                                     break
+                            
+                            if not should_restart:
+                                logging.info(f"[{self.service_name}] Auto-restart skipped: Error matched threshold but not restart keywords.")
                         else:
                             # Fallback: Restart on any error if no specific keywords defined
                             should_restart = True
