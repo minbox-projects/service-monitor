@@ -305,24 +305,54 @@ class LogMonitor(threading.Thread):
         
         if not self.running: return
 
+        f = None
         try:
-            with open(self.log_path, 'r', encoding='utf-8', errors='ignore') as f:
-                f.seek(0, 2)
-                
-                while self.running:
-                    line = f.readline()
-                    if not line:
-                        time.sleep(1)
-                        try:
-                            if os.stat(self.log_path).st_size < f.tell():
+            f = open(self.log_path, 'r', encoding='utf-8', errors='ignore')
+            # Start at the end of the file to ignore old logs
+            f.seek(0, 2)
+            # Get the current file's inode to detect rotation
+            try:
+                cur_ino = os.fstat(f.fileno()).st_ino
+            except AttributeError:
+                cur_ino = None
+
+            while self.running:
+                line = f.readline()
+                if not line:
+                    time.sleep(1)
+                    try:
+                        if os.path.exists(self.log_path):
+                            stat = os.stat(self.log_path)
+                            
+                            # Check for rotation (inode changed)
+                            if cur_ino is not None and stat.st_ino != cur_ino:
+                                logging.info(f"[{self.service_name}] Log rotation detected. Reopening {self.log_path}")
+                                f.close()
+                                f = open(self.log_path, 'r', encoding='utf-8', errors='ignore')
+                                cur_ino = os.fstat(f.fileno()).st_ino
+                                # New file detected, read from the beginning
                                 f.seek(0, 0)
-                        except FileNotFoundError:
-                            break
-                        continue
-                    
-                    self.check_line(line)
+                                continue
+
+                            # Check for truncation (size smaller than current position)
+                            if stat.st_size < f.tell():
+                                logging.info(f"[{self.service_name}] Log truncation detected. Rewinding.")
+                                f.seek(0, 0)
+                        
+                    except FileNotFoundError:
+                        # File might be temporarily missing during rotation
+                        pass
+                    except Exception as e:
+                        logging.error(f"[{self.service_name}] Error checking file state: {e}")
+                    continue
+                
+                self.check_line(line)
+
         except Exception as e:
             logging.error(f"[{self.service_name}] Error reading log: {e}")
+        finally:
+            if f:
+                f.close()
 
     def check_line(self, line):
         for keyword in self.keywords:
