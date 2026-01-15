@@ -15,6 +15,8 @@ from datetime import datetime
 from collections import defaultdict, deque
 from typing import List, Dict, Any, Optional, Tuple, Pattern
 import queue
+import random
+import string
 
 # Try imports
 try:
@@ -142,12 +144,37 @@ class EmailSender:
         except Exception as e:
             logging.error(f"Failed to send email: {e}")
 
+class RateLimiter:
+    """Simple rate limiter to prevent email bombing."""
+    def __init__(self, max_emails: int = 50, window_seconds: int = 3600):
+        self.max_emails = max_emails
+        self.window_seconds = window_seconds
+        self.history = deque()
+        self.lock = threading.Lock()
+
+    def check_limit(self) -> bool:
+        """Check if email can be sent based on global limits."""
+        with self.lock:
+            now = time.time()
+            # Remove expired samples
+            while self.history and self.history[0] < now - self.window_seconds:
+                self.history.popleft()
+            
+            if len(self.history) < self.max_emails:
+                self.history.append(now)
+                return True
+            return False
+
+    def get_count(self) -> int:
+        with self.lock:
+            return len(self.history)
+
 class AlertManager(threading.Thread):
     """
     Handles alert deduplication, aggregation, and sending via a background queue.
     Optimization: Separated email sending and alert collection to avoid locking the main logic.
     """
-    def __init__(self, email_sender: EmailSender, cooldown_seconds: int = 300, aggregation_window: int = 60, service_map: Dict[str, Any] = None):
+    def __init__(self, email_sender: EmailSender, cooldown_seconds: int = 300, aggregation_window: int = 60, service_map: Dict[str, Any] = None, rate_limit_config: Dict[str, Any] = None):
         super().__init__()
         self.email_sender = email_sender
         self.cooldown = cooldown_seconds
@@ -155,6 +182,12 @@ class AlertManager(threading.Thread):
         self.service_map = service_map or {}
         self.daemon = True
         self.stop_event = threading.Event()
+        
+        # Anti-spam and anti-bombing
+        self.rate_limiter = RateLimiter(
+            max_emails=rate_limit_config.get('max_per_hour', 50) if rate_limit_config else 50,
+            window_seconds=3600
+        )
         
         self.pending_alerts = [] # List of alert dicts
         self.last_sent = {} # Key: signature, Value: timestamp
@@ -237,8 +270,19 @@ class AlertManager(threading.Thread):
         else:
             subject = f"Multiple Alerts ({len(self.pending_alerts)})"
 
-        # Push to background sender queue instead of sending immediately under lock
-        self.mail_queue.put((subject, full_body, True))
+        # Anti-spam: Add unique ID to subject
+        unique_id = ''.join(random.choices(string.ascii_lowercase + string.digits, k=4))
+        subject = f"{subject} [ID: {unique_id}]"
+
+        # Anti-bombing: Check global rate limit
+        if self.rate_limiter.check_limit():
+            # Push to background sender queue
+            self.mail_queue.put((subject, full_body, True))
+        else:
+            logging.warning(f"Global email rate limit exceeded ({self.rate_limiter.max_emails}/hr). Alert summary dropped.")
+            # Optionally send a single critical notification if it's the first time exceeding
+            if self.rate_limiter.get_count() == self.rate_limiter.max_emails:
+                 self.mail_queue.put(("CRITICAL: Email Rate Limit Exceeded", "Global email limit reached. Further alerts will be suppressed for this hour.", True))
         
         self.pending_alerts = []
         self.last_flush_time = time.time()
@@ -957,7 +1001,8 @@ def main():
         email_sender, 
         config.alert_cooldown, 
         config.aggregation_window,
-        service_map
+        service_map,
+        rate_limit_config=config.data.get('alert_config', {}).get('rate_limit')
     )
     alert_manager.start()
     

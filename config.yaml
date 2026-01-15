@@ -23,6 +23,8 @@ email:
 alert_config:
   cooldown_seconds: 300       # Cooldown for same alert type
   aggregation_window: 60      # Wait time to collect alerts before sending (batching)
+  rate_limit:
+    max_per_hour: 50          # Global email limit to prevent bombing
 
 # Global Error Keywords (Regex supported)
 # These apply if a service doesn't have specific log rules
