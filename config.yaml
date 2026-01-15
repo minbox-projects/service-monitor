@@ -104,4 +104,4 @@ system_resources:
     alert_threshold: 90 # %
     duration_seconds: 300 # Alert if high for 5 mins
   network:
-    interface: "eth0"
+    interface: "" # Network interface to monitor (e.g., "eth0", leave empty for auto-detect)

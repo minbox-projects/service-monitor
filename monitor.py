@@ -13,6 +13,8 @@ from logging.handlers import RotatingFileHandler
 from email.mime.text import MIMEText
 from datetime import datetime
 from collections import defaultdict, deque
+from typing import List, Dict, Any, Optional, Tuple, Pattern
+import queue
 
 # Try imports
 try:
@@ -100,23 +102,22 @@ class Config:
         self.aggregation_window = alert_cfg.get('aggregation_window', 60)
 
 class EmailSender:
-    def __init__(self, config):
+    def __init__(self, config: Dict[str, Any]):
         self.config = config
         self.hostname, self.ip = get_host_info()
 
-    def send_email_immediate(self, subject, body, is_alert=True):
+    def send_email_immediate(self, subject: str, body: str, is_alert: bool = True) -> None:
+        """Send an email immediately. Note: This is now called from a background thread to avoid blocking."""
         msg = MIMEText(body, 'plain', 'utf-8')
         subject_prefix = f"[{self.hostname} ({self.ip})]"
         msg['Subject'] = f"{subject_prefix} {'[ALERT]' if is_alert else '[INFO]'} {subject}"
         msg['From'] = self.config['sender']
         
-        # Ensure receivers is a list of strings
         receivers = self.config['receivers']
         if isinstance(receivers, str):
             receivers = [receivers]
         msg['To'] = ", ".join(receivers)
         
-        # Add standard headers to reduce spam classification
         msg['Date'] = datetime.now().strftime('%a, %d %b %Y %H:%M:%S %z')
         msg['Message-ID'] = f"<{datetime.now().timestamp()}@{self.hostname}>"
 
@@ -143,34 +144,36 @@ class EmailSender:
 
 class AlertManager(threading.Thread):
     """
-    Handles alert deduplication, aggregation, and sending.
-    Feature 4: Alert Deduplication and Aggregation
+    Handles alert deduplication, aggregation, and sending via a background queue.
+    Optimization: Separated email sending and alert collection to avoid locking the main logic.
     """
-    def __init__(self, email_sender, cooldown_seconds=300, aggregation_window=60, service_map=None):
+    def __init__(self, email_sender: EmailSender, cooldown_seconds: int = 300, aggregation_window: int = 60, service_map: Dict[str, Any] = None):
         super().__init__()
         self.email_sender = email_sender
         self.cooldown = cooldown_seconds
         self.window = aggregation_window
         self.service_map = service_map or {}
         self.daemon = True
-        self.running = True
+        self.stop_event = threading.Event()
         
-        self.pending_alerts = [] # List of (subject, message, service_name)
-        self.last_sent = {} # Key: (service_name, alert_type_signature), Value: timestamp
+        self.pending_alerts = [] # List of alert dicts
+        self.last_sent = {} # Key: signature, Value: timestamp
         self.lock = threading.Lock()
         self.last_flush_time = time.time()
+        
+        self.mail_queue = queue.Queue()
+        self.sender_thread = threading.Thread(target=self._sender_loop, daemon=True)
+        self.sender_thread.start()
 
-    def add_alert(self, service_name, subject, message, immediate=False):
+    def add_alert(self, service_name: str, subject: str, message: str, immediate: bool = False) -> None:
         """Add an alert to be processed."""
         with self.lock:
-            # Simple signature to identify alert type
             signature = f"{service_name}:{subject}"
             now = time.time()
             
-            # Check cooldown
             last_time = self.last_sent.get(signature, 0)
             if now - last_time < self.cooldown:
-                logging.info(f"[{service_name}] Suppressing alert '{subject}' (Cooldown active)")
+                logging.debug(f"[{service_name}] Suppressing alert '{subject}' (Cooldown active)")
                 return
 
             self.pending_alerts.append({
@@ -185,35 +188,34 @@ class AlertManager(threading.Thread):
                 logging.info(f"[{service_name}] Immediate flush requested for: {subject}")
                 self._flush_pending()
             
-    def run(self):
-        while self.running:
+    def run(self) -> None:
+        while not self.stop_event.is_set():
             time.sleep(5)
             self._check_flush()
+        
+        # Final flush on stop
+        with self.lock:
+            self._flush_pending()
 
-    def _check_flush(self):
+    def _check_flush(self) -> None:
         with self.lock:
             if not self.pending_alerts:
                 return
             
-            # Check if window passed or critical mass?
-            # For now, strictly follow time window
             if time.time() - self.last_flush_time < self.window:
                 return
 
             self._flush_pending()
 
-    def _flush_pending(self):
+    def _flush_pending(self) -> None:
         # NOTE: This method must be called with self.lock held
         if not self.pending_alerts:
             return
 
-        # Flush alerts
-        logging.info(f"Flushing {len(self.pending_alerts)} alerts...")
+        logging.info(f"Packaging {len(self.pending_alerts)} alerts for background sending...")
         
-        # Group by Service
         grouped_msg = ["Monitor Alerts Report", "====================="]
         
-        # Update last_sent timestamps
         for alert in self.pending_alerts:
             self.last_sent[alert['signature']] = time.time()
             service_name = alert['service']
@@ -230,25 +232,43 @@ class AlertManager(threading.Thread):
 
         full_body = "\n".join(grouped_msg)
         
-        # Determine subject
         if len(self.pending_alerts) == 1:
             subject = f"{self.pending_alerts[0]['service']}: {self.pending_alerts[0]['subject']}"
         else:
             subject = f"Multiple Alerts ({len(self.pending_alerts)})"
 
-        self.email_sender.send_email_immediate(subject, full_body, is_alert=True)
+        # Push to background sender queue instead of sending immediately under lock
+        self.mail_queue.put((subject, full_body, True))
         
         self.pending_alerts = []
         self.last_flush_time = time.time()
 
+    def _sender_loop(self) -> None:
+        """Background loop to process the email queue."""
+        while not self.stop_event.is_set() or not self.mail_queue.empty():
+            try:
+                # Use a timeout to occasionally check stop_event
+                item = self.mail_queue.get(timeout=2)
+                subject, body, is_alert = item
+                self.email_sender.send_email_immediate(subject, body, is_alert)
+                self.mail_queue.task_done()
+            except queue.Empty:
+                continue
+            except Exception as e:
+                logging.error(f"Error in AlertManager sender loop: {e}")
+
 class LogMonitor(threading.Thread):
-    def __init__(self, service_config, global_keywords, global_restart_keywords, alert_manager):
+    """
+    Monitors a log file for specific keywords and triggers alerts or restarts.
+    """
+    def __init__(self, service_config: Dict[str, Any], global_keywords: List[Pattern], global_restart_keywords: List[Pattern], alert_manager: AlertManager, docker_client: Optional[Any] = None):
         super().__init__()
         self.service_name = service_config['name']
         self.log_path = service_config.get('log_file_path')
         self.alert_manager = alert_manager
-        self.running = True
+        self.stop_event = threading.Event()
         self.daemon = True
+        self.docker_client = docker_client
         
         # Merge global keywords with service-specific keywords
         self.keywords = list(global_keywords) # Copy global list
@@ -284,8 +304,8 @@ class LogMonitor(threading.Thread):
         self.last_restart_time = 0
         self.container_name = service_config.get('docker_container_name')
         
-        self.docker_client = None
-        if self.auto_restart and self.container_name and docker:
+        # Docker client is now injected
+        if not self.docker_client and self.auto_restart and self.container_name and docker:
             try:
                 self.docker_client = docker.from_env()
             except Exception as e:
@@ -294,16 +314,16 @@ class LogMonitor(threading.Thread):
         # Store error timestamps
         self.error_history = deque()
 
-    def run(self):
+    def run(self) -> None:
         if not self.log_path:
             return
 
         logging.info(f"[{self.service_name}] Starting log monitor for: {self.log_path}")
         
-        while not os.path.exists(self.log_path) and self.running:
+        while not os.path.exists(self.log_path) and not self.stop_event.is_set():
             time.sleep(5)
         
-        if not self.running: return
+        if self.stop_event.is_set(): return
 
         f = None
         try:
@@ -316,7 +336,7 @@ class LogMonitor(threading.Thread):
             except AttributeError:
                 cur_ino = None
 
-            while self.running:
+            while not self.stop_event.is_set():
                 line = f.readline()
                 if not line:
                     time.sleep(1)
@@ -465,25 +485,19 @@ class LogMonitor(threading.Thread):
 
 class HealthMonitor(threading.Thread):
     """
+    Performs HTTP, TCP, or Docker status health checks on services.
     Feature 1: HTTP/TCP Health Checks
     Also handles Docker Container checks (Explicitly or Implicitly).
     """
-    def __init__(self, service_config, alert_manager):
+    def __init__(self, service_config: Dict[str, Any], alert_manager: AlertManager, docker_client: Optional[Any] = None):
         super().__init__()
         self.service_config = service_config
         self.service_name = service_config['name']
         self.config = service_config.get('health_check') or {}
         self.alert_manager = alert_manager
-        self.running = True
+        self.stop_event = threading.Event()
         self.daemon = True
-        
-        # Docker client setup
-        self.docker_client = None
-        if self.service_config.get('docker_container_name'):
-            try:
-                self.docker_client = docker.from_env() if docker else None
-            except Exception as e:
-                logging.error(f"[{self.service_name}] Docker client init failed: {e}")
+        self.docker_client = docker_client
         
         # Auto Restart Config
         restart_cfg = service_config.get('auto_restart', {})
@@ -520,7 +534,7 @@ class HealthMonitor(threading.Thread):
         check_names = [f.__name__ for f in checks]
         logging.info(f"[{self.service_name}] Starting checks: {', '.join(check_names)} (Interval: {interval}s)")
 
-        while self.running:
+        while not self.stop_event.is_set():
             for check_func in checks:
                 try:
                     check_func()
@@ -726,12 +740,12 @@ class HealthMonitor(threading.Thread):
         logging.error(f"[{self.service_name}] Recovery check timed out (Container not running after 5m).")
 
 class SystemResourceMonitor(threading.Thread):
-    def __init__(self, config, alert_manager):
+    def __init__(self, config: Dict[str, Any], alert_manager: AlertManager):
         super().__init__()
         self.config = config.get('system_resources', {})
         self.alert_manager = alert_manager
         self.daemon = True
-        self.running = True
+        self.stop_event = threading.Event()
         self.check_interval = self.config.get('check_interval', 60)
         
         # Stats for daily report
@@ -754,7 +768,7 @@ class SystemResourceMonitor(threading.Thread):
             return
 
         logging.info("SystemResourceMonitor started.")
-        while self.running:
+        while not self.stop_event.is_set():
             try:
                 self._check_resources()
             except Exception as e:
@@ -854,14 +868,11 @@ class SystemResourceMonitor(threading.Thread):
         return lines
 
 class DailySummaryReporter:
-    def __init__(self, config, email_sender, system_monitor=None):
+    def __init__(self, config: Config, email_sender: EmailSender, system_monitor: Optional[SystemResourceMonitor] = None, docker_client: Optional[Any] = None):
         self.services = config.services
         self.email_sender = email_sender
         self.system_monitor = system_monitor
-        try:
-            self.docker_client = docker.from_env() if docker else None
-        except Exception:
-            self.docker_client = None
+        self.docker_client = docker_client
 
     def send_report(self):
         try:
@@ -931,6 +942,15 @@ def main():
     
     email_sender = EmailSender(config.email_config)
     
+    # Initialize Global Docker Client
+    global_docker = None
+    if docker:
+        try:
+            global_docker = docker.from_env()
+            logging.info("Global Docker client initialized.")
+        except Exception as e:
+            logging.error(f"Failed to initialize global Docker client: {e}")
+
     # Initialize Alert Manager
     service_map = {s['name']: s for s in config.services}
     alert_manager = AlertManager(
@@ -950,18 +970,18 @@ def main():
     for service in config.services:
         # Start Log Monitors
         if service.get('log_file_path'):
-            t = LogMonitor(service, config.keywords, config.restart_keywords, alert_manager)
+            t = LogMonitor(service, config.keywords, config.restart_keywords, alert_manager, docker_client=global_docker)
             t.start()
             threads.append(t)
         
         # Start Health Monitors (Explicit or Implicit via Docker)
         if service.get('health_check') or service.get('docker_container_name'):
-            t = HealthMonitor(service, alert_manager)
+            t = HealthMonitor(service, alert_manager, docker_client=global_docker)
             t.start()
             threads.append(t)
 
     # Setup Scheduled Summaries
-    summary_reporter = DailySummaryReporter(config, email_sender, system_monitor)
+    summary_reporter = DailySummaryReporter(config, email_sender, system_monitor, docker_client=global_docker)
     for report_time in config.reporting_times:
         schedule.every().day.at(report_time).do(summary_reporter.send_report)
         logging.info(f"Daily summary scheduled for {report_time}.")
@@ -969,13 +989,26 @@ def main():
     logging.info("Monitor service started. Press Ctrl+C to stop.")
 
     def signal_handler(sig, frame):
-        logging.info("Stopping monitors...")
-        alert_manager.running = False
+        logging.info("Shutdown signal received. Stopping monitors...")
+        
+        # Signal all threads to stop
+        alert_manager.stop_event.set()
+        system_monitor.stop_event.set()
         for t in threads:
-            t.running = False
+            t.stop_event.set()
+        
+        # Wait for threads to finish (graceful shutdown)
+        logging.info("Waiting for threads to exit...")
+        alert_manager.join(timeout=5)
+        system_monitor.join(timeout=5)
+        for t in threads:
+            t.join(timeout=2)
+            
+        logging.info("All monitors stopped. Exiting.")
         sys.exit(0)
 
     signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
 
     # Keep main thread alive and run schedule
     while True:
