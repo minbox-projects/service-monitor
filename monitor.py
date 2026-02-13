@@ -2,6 +2,7 @@ import time
 import yaml
 import os
 import re
+import math
 import smtplib
 import threading
 import signal
@@ -103,6 +104,15 @@ class Config:
         self.alert_cooldown = alert_cfg.get('cooldown_seconds', 300)
         self.aggregation_window = alert_cfg.get('aggregation_window', 60)
 
+        # Backoff Config (exponential backoff for repeated alerts)
+        backoff_cfg = alert_cfg.get('backoff', {})
+        self.backoff_config = {
+            'enabled': backoff_cfg.get('enabled', True),
+            'multiplier': backoff_cfg.get('multiplier', 3),
+            'max_interval': backoff_cfg.get('max_interval', 7200),
+            'recovery_window': backoff_cfg.get('recovery_window', 600),
+        }
+
 class EmailSender:
     def __init__(self, config: Dict[str, Any]):
         self.config = config
@@ -174,7 +184,7 @@ class AlertManager(threading.Thread):
     Handles alert deduplication, aggregation, and sending via a background queue.
     Optimization: Separated email sending and alert collection to avoid locking the main logic.
     """
-    def __init__(self, email_sender: EmailSender, cooldown_seconds: int = 300, aggregation_window: int = 60, service_map: Dict[str, Any] = None, rate_limit_config: Dict[str, Any] = None):
+    def __init__(self, email_sender: EmailSender, cooldown_seconds: int = 300, aggregation_window: int = 60, service_map: Dict[str, Any] = None, rate_limit_config: Dict[str, Any] = None, backoff_config: Dict[str, Any] = None):
         super().__init__()
         self.email_sender = email_sender
         self.cooldown = cooldown_seconds
@@ -182,32 +192,101 @@ class AlertManager(threading.Thread):
         self.service_map = service_map or {}
         self.daemon = True
         self.stop_event = threading.Event()
-        
+
         # Anti-spam and anti-bombing
         self.rate_limiter = RateLimiter(
             max_emails=rate_limit_config.get('max_per_hour', 50) if rate_limit_config else 50,
             window_seconds=3600
         )
-        
+
+        # Exponential backoff config
+        backoff_config = backoff_config or {}
+        self.backoff_enabled = backoff_config.get('enabled', True)
+        self.backoff_multiplier = backoff_config.get('multiplier', 3)
+        self.backoff_max_interval = backoff_config.get('max_interval', 7200)
+        self.backoff_recovery_window = backoff_config.get('recovery_window', 600)
+        # Per-service backoff overrides: {service_name: {max_interval, recovery_window, ...}}
+        self.service_backoff_overrides = {}
+
+        # Backoff state: {signature: {level, last_sent, last_seen, suppressed_count}}
+        self.backoff_state = {}
+
         self.pending_alerts = [] # List of alert dicts
         self.last_sent = {} # Key: signature, Value: timestamp
         self.lock = threading.Lock()
         self.last_flush_time = time.time()
-        
+
         self.mail_queue = queue.Queue()
         self.sender_thread = threading.Thread(target=self._sender_loop, daemon=True)
         self.sender_thread.start()
 
+    def register_service_backoff(self, service_name: str, overrides: Dict[str, Any]) -> None:
+        """Register per-service backoff overrides."""
+        self.service_backoff_overrides[service_name] = overrides
+
+    def _get_backoff_interval(self, service_name: str, level: int) -> int:
+        """Calculate the backoff interval for a given level, respecting per-service overrides."""
+        overrides = self.service_backoff_overrides.get(service_name, {})
+        multiplier = overrides.get('multiplier', self.backoff_multiplier)
+        max_interval = overrides.get('max_interval', self.backoff_max_interval)
+        # Cap level to avoid computing astronomically large intermediates
+        if multiplier > 1 and self.cooldown > 0:
+            max_level = int(math.log(max_interval / self.cooldown, multiplier)) + 1
+            level = min(level, max_level)
+        return min(self.cooldown * (multiplier ** level), max_interval)
+
+    def _get_recovery_window(self, service_name: str) -> int:
+        overrides = self.service_backoff_overrides.get(service_name, {})
+        return overrides.get('recovery_window', self.backoff_recovery_window)
+
+    def touch_alert(self, service_name: str, subject: str) -> None:
+        """Update last_seen timestamp for a signature (called even when alert is suppressed)."""
+        with self.lock:
+            signature = f"{service_name}:{subject}"
+            if signature in self.backoff_state:
+                self.backoff_state[signature]['last_seen'] = time.time()
+
     def add_alert(self, service_name: str, subject: str, message: str, immediate: bool = False) -> None:
-        """Add an alert to be processed."""
+        """Add an alert to be processed, with exponential backoff for repeated alerts."""
         with self.lock:
             signature = f"{service_name}:{subject}"
             now = time.time()
-            
-            last_time = self.last_sent.get(signature, 0)
-            if now - last_time < self.cooldown:
-                logging.debug(f"[{service_name}] Suppressing alert '{subject}' (Cooldown active)")
-                return
+
+            if self.backoff_enabled:
+                state = self.backoff_state.get(signature)
+
+                if state is not None:
+                    # Existing alert — apply exponential backoff
+                    state['last_seen'] = now
+                    interval = self._get_backoff_interval(service_name, state['level'])
+                    if now - state['last_sent'] < interval:
+                        state['suppressed_count'] += 1
+                        logging.debug(f"[{service_name}] Suppressing alert '{subject}' (Backoff L{state['level']}, next in {int(interval - (now - state['last_sent']))}s, suppressed={state['suppressed_count']})")
+                        return
+
+                    # Interval elapsed — send with suppression summary
+                    suppressed = state['suppressed_count']
+                    if suppressed > 0:
+                        message = f"{message}\n[Suppressed {suppressed} identical alerts since last notification]"
+                    state['level'] += 1
+                    state['last_sent'] = now
+                    state['suppressed_count'] = 0
+                    logging.info(f"[{service_name}] Alert '{subject}' sent at backoff level {state['level']}")
+                else:
+                    # First occurrence — initialize backoff state and send immediately
+                    self.backoff_state[signature] = {
+                        'level': 0,
+                        'last_sent': now,
+                        'last_seen': now,
+                        'suppressed_count': 0,
+                    }
+                    logging.info(f"[{service_name}] First alert '{subject}' — sending immediately")
+            else:
+                # Backoff disabled — fallback to simple cooldown
+                last_time = self.last_sent.get(signature, 0)
+                if now - last_time < self.cooldown:
+                    logging.debug(f"[{service_name}] Suppressing alert '{subject}' (Cooldown active)")
+                    return
 
             self.pending_alerts.append({
                 'service': service_name,
@@ -216,19 +295,59 @@ class AlertManager(threading.Thread):
                 'time': datetime.now().strftime('%H:%M:%S'),
                 'signature': signature
             })
-            
+
             if immediate:
                 logging.info(f"[{service_name}] Immediate flush requested for: {subject}")
                 self._flush_pending()
             
     def run(self) -> None:
+        last_recovery_check = 0
         while not self.stop_event.is_set():
             time.sleep(5)
             self._check_flush()
-        
+            if self.backoff_enabled:
+                now = time.time()
+                if now - last_recovery_check >= 30:
+                    self._check_recovery()
+                    last_recovery_check = now
+
         # Final flush on stop
         with self.lock:
             self._flush_pending()
+
+    def _check_recovery(self) -> None:
+        """Check for alerts that have recovered (no new occurrences within recovery_window)."""
+        with self.lock:
+            now = time.time()
+            recovered = []
+            for signature, state in self.backoff_state.items():
+                # Only check signatures that have been escalated (level > 0 or had suppressions)
+                if state['level'] == 0 and state['suppressed_count'] == 0:
+                    continue
+
+                service_name = signature.split(':', 1)[0]
+                recovery_window = self._get_recovery_window(service_name)
+                if now - state['last_seen'] >= recovery_window:
+                    recovered.append((signature, service_name, state))
+
+            for signature, service_name, state in recovered:
+                suppressed = state['suppressed_count']
+                subject = signature.split(':', 1)[1]
+                elapsed = int(now - state['last_seen'])
+
+                recovery_msg = f"Alert '{subject}' has not recurred for {elapsed}s."
+                if suppressed > 0:
+                    recovery_msg += f"\n[{suppressed} alerts were suppressed during this incident]"
+
+                self.pending_alerts.append({
+                    'service': service_name,
+                    'subject': f"RECOVERED: {subject}",
+                    'message': recovery_msg,
+                    'time': datetime.now().strftime('%H:%M:%S'),
+                    'signature': f"{service_name}:RECOVERED:{subject}"
+                })
+                del self.backoff_state[signature]
+                logging.info(f"[{service_name}] Alert '{subject}' recovered — backoff state cleared")
 
     def _check_flush(self) -> None:
         with self.lock:
@@ -358,6 +477,11 @@ class LogMonitor(threading.Thread):
         # Store error timestamps
         self.error_history = deque()
 
+        # Register per-service backoff overrides if configured
+        service_backoff = self.log_rules.get('backoff', {})
+        if service_backoff:
+            self.alert_manager.register_service_backoff(self.service_name, service_backoff)
+
     def run(self) -> None:
         if not self.log_path:
             return
@@ -423,11 +547,14 @@ class LogMonitor(threading.Thread):
             if keyword.search(line):
                 now = time.time()
                 self.error_history.append(now)
-                
+
+                # Always update last_seen for recovery detection
+                self.alert_manager.touch_alert(self.service_name, "Log Error Threshold Exceeded")
+
                 # Cleanup old errors
                 while self.error_history and self.error_history[0] < now - self.threshold_window:
                     self.error_history.popleft()
-                
+
                 # Check threshold
                 if len(self.error_history) >= self.threshold_count:
                     self.alert_manager.add_alert(
@@ -435,7 +562,7 @@ class LogMonitor(threading.Thread):
                         "Log Error Threshold Exceeded",
                         f"Keyword: {keyword.pattern}\nMatched {len(self.error_history)} times in {self.threshold_window}s\nLast Line: {line.strip()}"
                     )
-                    
+
                     if self.auto_restart:
                         should_restart = False
                         if self.restart_keywords:
@@ -998,11 +1125,12 @@ def main():
     # Initialize Alert Manager
     service_map = {s['name']: s for s in config.services}
     alert_manager = AlertManager(
-        email_sender, 
-        config.alert_cooldown, 
+        email_sender,
+        config.alert_cooldown,
         config.aggregation_window,
         service_map,
-        rate_limit_config=config.data.get('alert_config', {}).get('rate_limit')
+        rate_limit_config=config.data.get('alert_config', {}).get('rate_limit'),
+        backoff_config=config.backoff_config
     )
     alert_manager.start()
     

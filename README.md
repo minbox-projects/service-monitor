@@ -12,6 +12,8 @@
 - **系统资源监控**：监控宿主机的 CPU、内存、磁盘空间及网络 I/O，支持静默采集与高阈值告警。
 - **日志监控**：实时追踪日志文件，支持正则关键字匹配和错误频率阈值。
 - **智能告警策略**：
+    - **指数退避**：重复告警的发送间隔自动指数增长（如 5min→15min→30min→1h→2h），避免持续性错误引发告警风暴。
+    - **恢复通知**：当错误在配置的时间窗口内不再出现，自动发送 `RECOVERED` 通知并重置退避状态。
     - **去重**：避免因同一错误重复发送邮件。
     - **聚合**：将时间窗口内的多条告警汇总为一封邮件发送。
     - **环境感知**：邮件标题自动包含服务器的主机名和内网 IP。
@@ -54,8 +56,13 @@
 
    # 全局告警设置
    alert_config:
-     cooldown_seconds: 300       # 同类型告警冷却时间 (秒)
+     cooldown_seconds: 300       # 告警退避基础间隔 (秒)
      aggregation_window: 60      # 告警聚合发送窗口 (秒)
+     backoff:
+       enabled: true             # 启用指数退避 (重复告警间隔自动增长)
+       multiplier: 3             # 退避倍数 (300s → 900s → 2700s → ...)
+       max_interval: 7200        # 最大退避间隔上限 (2小时)
+       recovery_window: 600      # 无错误持续时间达此值后发送恢复通知 (秒)
 
    # 全局错误关键字（支持正则，适用于未单独配置 log_rules 的服务）
    error_keywords:
@@ -149,8 +156,12 @@
    | `email.use_tls` | 是否使用 STARTTLS | `true` | - |
    | `email.receivers` | 接收告警的邮箱列表 | (Required) | - |
    | **`alert_config`** | **全局告警策略** | | |
-   | `alert_config.cooldown_seconds` | 同类告警冷却时间 (避免刷屏) | `300` | 秒 (s) |
+   | `alert_config.cooldown_seconds` | 告警退避基础间隔 (首次告警后的最短静默期) | `300` | 秒 (s) |
    | `alert_config.aggregation_window` | 告警聚合发送窗口 (合并告警) | `60` | 秒 (s) |
+   | `alert_config.backoff.enabled` | 是否启用指数退避 | `true` | - |
+   | `alert_config.backoff.multiplier` | 退避倍数 (每次间隔 = 上次 × 此值) | `3` | - |
+   | `alert_config.backoff.max_interval` | 退避间隔上限 | `7200` | 秒 (s) |
+   | `alert_config.backoff.recovery_window` | 无错误持续此时长后发送恢复通知 | `600` | 秒 (s) |
    | `error_keywords` | **全局错误关键字列表** (正则) | `[]` | - |
    | `global_restart_keywords` | **[New]** 全局重启关键字列表 (对所有开启重启的服务生效) | `[]` | - |
    | **`reporting`** | **定时报告** | | |
@@ -170,6 +181,8 @@
    | `services[].error_keywords` | **[New]** 服务特有的错误关键字列表 (与全局合并) | `[]` | - |
    | `services[].log_rules.error_threshold_count` | 日志告警触发的最小错误次数 | `1` | 次 |
    | `services[].log_rules.error_threshold_window` | 日志错误计数的滑动窗口 | `60` | 秒 (s) |
+   | `services[].log_rules.backoff.max_interval` | [可选] 覆盖全局退避间隔上限 | 继承全局 | 秒 (s) |
+   | `services[].log_rules.backoff.recovery_window` | [可选] 覆盖全局恢复检测窗口 | 继承全局 | 秒 (s) |
    | `services[].auto_restart.enabled` | **[New]** 是否启用自动重启 | `false` | - |
    | `services[].auto_restart.keywords` | **[New]** 仅针对匹配这些正则的错误才重启 | `[]` (全部) | - |
    | `services[].auto_restart.cooldown` | **[New]** 自动重启的冷却时间 | `300` | 秒 (s) |
@@ -212,7 +225,15 @@
 - 设置阈值为 `90%` 意味着该容器占用了整台服务器 90% 的计算能力，无论服务器有多少个核心。
 
 ## 告警聚合、去重与防轰炸
-- **去重**：如果触发了一个告警（例如“容器宕机”），在 `cooldown_seconds`（默认 5 分钟）内不会再次为同一服务发送相同的告警。
+- **指数退避 (Exponential Backoff)**：对于持续性重复错误（如网络断连重试），告警发送间隔自动指数增长。以默认配置为例：
+    - 首次触发 → **立即发送**
+    - 之后 300s 内 → 抑制
+    - 300s 后 → 发送第 2 次告警（附带 `[Suppressed N identical alerts]`）
+    - 之后 900s 内 → 抑制
+    - 900s 后 → 发送第 3 次
+    - 依此类推，直到达到 `max_interval`（默认 7200s = 2 小时）后以固定间隔发送
+- **恢复通知 (Recovery)**：当某错误在 `recovery_window`（默认 600s）内不再出现，自动发送一封 `RECOVERED` 通知，并重置退避状态。下次同错误再现时将重新从"首次告警"开始。
+- **可配置粒度**：退避策略支持全局默认 + 每服务单独覆盖（通过 `services[].log_rules.backoff`）。
 - **聚合**：如果在 `aggregation_window`（默认 60 秒）内发生了多个告警，将汇总为一封邮件发送。标题末尾会自动追加短随机 ID 以绕过邮件服务商的相同标题过滤机制。
 - **防轰炸 (Rate Limiting)**：引入了全局限流机制。默认情况下，每小时最多允许发送 50 封邮件，超过阈值后将自动抑制后续告警，并在达到阈值时发送一封警告通知，确保不会因故障风暴引发邮件轰炸。
 

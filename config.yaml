@@ -21,8 +21,13 @@ email:
 
 # Global Alert Settings
 alert_config:
-  cooldown_seconds: 300       # Cooldown for same alert type
+  cooldown_seconds: 300       # Base interval for alert deduplication (also backoff base)
   aggregation_window: 60      # Wait time to collect alerts before sending (batching)
+  backoff:
+    enabled: true             # Enable exponential backoff for repeated alerts
+    multiplier: 3             # Backoff multiplier (300s → 900s → 2700s → ...)
+    max_interval: 7200        # Maximum backoff interval cap (2 hours)
+    recovery_window: 600      # Seconds without error to trigger RECOVERED notification
   rate_limit:
     max_per_hour: 50          # Global email limit to prevent bombing
 
@@ -66,6 +71,10 @@ services:
     log_rules:
       error_threshold_count: 10   # Alert if > 10 errors matched
       error_threshold_window: 60  # ... in 60 seconds
+      # Per-service backoff override (optional, inherits from global alert_config.backoff)
+      # backoff:
+      #   max_interval: 3600      # Override max backoff to 1 hour
+      #   recovery_window: 300    # Recover after 5 mins without errors
       # Auto-Restart Config
       auto_restart: true          # Automatically restart docker container on error threshold
       restart_keywords:
