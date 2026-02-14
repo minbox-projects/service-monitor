@@ -1,5 +1,7 @@
 # Monitoring Configuration
 
+language: "zh"
+
 # Logging Settings
 logging:
   enabled: true

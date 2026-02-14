@@ -10,6 +10,8 @@ import sys
 import schedule
 import socket
 import logging
+import i18n
+from i18n import t
 from logging.handlers import RotatingFileHandler
 from email.mime.text import MIMEText
 from datetime import datetime
@@ -93,6 +95,7 @@ class Config:
         with open(config_path, 'r') as f:
             self.data = yaml.safe_load(f)
         
+        self.language = self.data.get('language', 'en')
         self.email_config = self.data.get('email', {})
         self.services = self.data.get('services', [])
         self.keywords = [re.compile(k) for k in self.data.get('error_keywords', [])]
@@ -122,7 +125,8 @@ class EmailSender:
         """Send an email immediately. Note: This is now called from a background thread to avoid blocking."""
         msg = MIMEText(body, 'plain', 'utf-8')
         subject_prefix = f"[{self.hostname} ({self.ip})]"
-        msg['Subject'] = f"{subject_prefix} {'[ALERT]' if is_alert else '[INFO]'} {subject}"
+        tag = t('email.alert_tag') if is_alert else t('email.info_tag')
+        msg['Subject'] = f"{subject_prefix} {tag} {subject}"
         msg['From'] = self.config['sender']
         
         receivers = self.config['receivers']
@@ -267,7 +271,7 @@ class AlertManager(threading.Thread):
                     # Interval elapsed — send with suppression summary
                     suppressed = state['suppressed_count']
                     if suppressed > 0:
-                        message = f"{message}\n[Suppressed {suppressed} identical alerts since last notification]"
+                        message = f"{message}\n{t('backoff.suppressed_summary', count=suppressed)}"
                     state['level'] += 1
                     state['last_sent'] = now
                     state['suppressed_count'] = 0
@@ -335,13 +339,14 @@ class AlertManager(threading.Thread):
                 subject = signature.split(':', 1)[1]
                 elapsed = int(now - state['last_seen'])
 
-                recovery_msg = f"Alert '{subject}' has not recurred for {elapsed}s."
+                recovery_msg = t('backoff.recovery_msg', subject=subject, elapsed=elapsed)
                 if suppressed > 0:
-                    recovery_msg += f"\n[{suppressed} alerts were suppressed during this incident]"
+                    recovery_msg += f"\n{t('backoff.suppressed_during', count=suppressed)}"
 
+                recovered_subject = t('backoff.recovered_prefix', subject=subject)
                 self.pending_alerts.append({
                     'service': service_name,
-                    'subject': f"RECOVERED: {subject}",
+                    'subject': recovered_subject,
                     'message': recovery_msg,
                     'time': datetime.now().strftime('%H:%M:%S'),
                     'signature': f"{service_name}:RECOVERED:{subject}"
@@ -366,28 +371,29 @@ class AlertManager(threading.Thread):
 
         logging.info(f"Packaging {len(self.pending_alerts)} alerts for background sending...")
         
-        grouped_msg = ["Monitor Alerts Report", "====================="]
-        
+        report_title = t('alert.report_title')
+        grouped_msg = [report_title, "=" * len(report_title)]
+
         for alert in self.pending_alerts:
             self.last_sent[alert['signature']] = time.time()
             service_name = alert['service']
-            grouped_msg.append(f"\n[{alert['time']}] Service: {service_name}")
-            
+            grouped_msg.append(f"\n[{alert['time']}] {t('alert.service_label', service=service_name)}")
+
             if service_name in self.service_map:
                 log_path = self.service_map[service_name].get('log_file_path')
                 if log_path:
-                    grouped_msg.append(f"Log File: {log_path}")
-            
-            grouped_msg.append(f"Subject: {alert['subject']}")
-            grouped_msg.append(f"Detail: {alert['message']}")
+                    grouped_msg.append(t('alert.log_file_label', path=log_path))
+
+            grouped_msg.append(t('alert.subject_label', subject=alert['subject']))
+            grouped_msg.append(t('alert.detail_label', detail=alert['message']))
             grouped_msg.append("-" * 30)
 
         full_body = "\n".join(grouped_msg)
-        
+
         if len(self.pending_alerts) == 1:
             subject = f"{self.pending_alerts[0]['service']}: {self.pending_alerts[0]['subject']}"
         else:
-            subject = f"Multiple Alerts ({len(self.pending_alerts)})"
+            subject = t('alert.multiple', count=len(self.pending_alerts))
 
         # Anti-spam: Add unique ID to subject
         unique_id = ''.join(random.choices(string.ascii_lowercase + string.digits, k=4))
@@ -398,10 +404,9 @@ class AlertManager(threading.Thread):
             # Push to background sender queue
             self.mail_queue.put((subject, full_body, True))
         else:
-            logging.warning(f"Global email rate limit exceeded ({self.rate_limiter.max_emails}/hr). Alert summary dropped.")
-            # Optionally send a single critical notification if it's the first time exceeding
+            logging.warning(t('alert.rate_limit_warning', max=self.rate_limiter.max_emails))
             if self.rate_limiter.get_count() == self.rate_limiter.max_emails:
-                 self.mail_queue.put(("CRITICAL: Email Rate Limit Exceeded", "Global email limit reached. Further alerts will be suppressed for this hour.", True))
+                 self.mail_queue.put((t('alert.rate_limit_exceeded'), t('alert.rate_limit_body'), True))
         
         self.pending_alerts = []
         self.last_flush_time = time.time()
@@ -549,7 +554,7 @@ class LogMonitor(threading.Thread):
                 self.error_history.append(now)
 
                 # Always update last_seen for recovery detection
-                self.alert_manager.touch_alert(self.service_name, "Log Error Threshold Exceeded")
+                self.alert_manager.touch_alert(self.service_name, t('log.error_threshold'))
 
                 # Cleanup old errors
                 while self.error_history and self.error_history[0] < now - self.threshold_window:
@@ -559,8 +564,8 @@ class LogMonitor(threading.Thread):
                 if len(self.error_history) >= self.threshold_count:
                     self.alert_manager.add_alert(
                         self.service_name,
-                        "Log Error Threshold Exceeded",
-                        f"Keyword: {keyword.pattern}\nMatched {len(self.error_history)} times in {self.threshold_window}s\nLast Line: {line.strip()}"
+                        t('log.error_threshold'),
+                        t('log.error_detail', keyword=keyword.pattern, count=len(self.error_history), window=self.threshold_window, line=line.strip())
                     )
 
                     if self.auto_restart:
@@ -601,8 +606,8 @@ class LogMonitor(threading.Thread):
             
             self.alert_manager.add_alert(
                 self.service_name,
-                "CRITICAL: Service Auto-Restarted",
-                f"Container '{self.container_name}' was restarted automatically.\nReason: Log keyword match '{reason}'",
+                t('log.restart_critical'),
+                t('log.restart_detail', container=self.container_name, reason=reason),
                 immediate=True
             )
 
@@ -613,8 +618,8 @@ class LogMonitor(threading.Thread):
             logging.error(f"[{self.service_name}] Auto-restart failed: {e}")
             self.alert_manager.add_alert(
                 self.service_name,
-                "Auto-Restart FAILED",
-                f"Attempted to restart '{self.container_name}' but failed: {e}"
+                t('log.restart_failed'),
+                t('log.restart_failed_detail', container=self.container_name, error=e)
             )
 
     def wait_for_recovery(self, container_name):
@@ -643,15 +648,15 @@ class LogMonitor(threading.Thread):
                 if container.status == 'running':
                     self.alert_manager.add_alert(
                         self.service_name,
-                        "RECOVERY: Service Restarted Successfully",
-                        f"Container '{container_name}' is back to 'running' state after auto-restart.",
+                        t('log.recovery_success'),
+                        t('log.recovery_detail', container=container_name),
                         immediate=True
                     )
                     logging.info(f"[{self.service_name}] Recovery detected and notified.")
                     return
             except Exception as e:
                 logging.warning(f"[{self.service_name}] Error checking recovery status: {e}")
-        
+
         logging.error(f"[{self.service_name}] Recovery check timed out (Container not running after 5m).")
 
 class HealthMonitor(threading.Thread):
@@ -712,7 +717,7 @@ class HealthMonitor(threading.Thread):
                 except Exception as e:
                     self.alert_manager.add_alert(
                         self.service_name,
-                        f"Check Failed",
+                        t('health.check_failed'),
                         str(e)
                     )
             
@@ -733,12 +738,12 @@ class HealthMonitor(threading.Thread):
 
     def check_docker(self):
         if not self.docker_client:
-            self.alert_manager.add_alert(self.service_name, "Docker Check Failed", "Docker client not available")
+            self.alert_manager.add_alert(self.service_name, t('health.docker_check_failed'), t('health.docker_unavailable'))
             return
 
         container_name = self.service_config.get('docker_container_name')
         if not container_name:
-             self.alert_manager.add_alert(self.service_name, "Config Error", "Missing 'docker_container_name'")
+             self.alert_manager.add_alert(self.service_name, t('health.config_error'), t('health.missing_container_name'))
              return
 
         try:
@@ -753,8 +758,8 @@ class HealthMonitor(threading.Thread):
 
                 self.alert_manager.add_alert(
                     self.service_name,
-                    f"Container Down",
-                    f"Container '{container_name}' status is '{container.status}'"
+                    t('health.container_down'),
+                    t('health.container_status', container=container_name, status=container.status)
                 )
                 
                 if self.auto_restart:
@@ -776,8 +781,8 @@ class HealthMonitor(threading.Thread):
                 if mem_threshold and mem_percent > mem_threshold:
                         self.alert_manager.add_alert(
                         self.service_name,
-                        "High Memory Usage",
-                        f"Usage: {mem_percent:.2f}% (Threshold: {mem_threshold}%)"
+                        t('health.high_memory'),
+                        t('health.usage_threshold', percent=mem_percent, threshold=mem_threshold)
                     )
 
                 # CPU
@@ -786,15 +791,15 @@ class HealthMonitor(threading.Thread):
                 if cpu_threshold and cpu_percent > cpu_threshold:
                         self.alert_manager.add_alert(
                         self.service_name,
-                        "High CPU Usage",
-                        f"Usage: {cpu_percent:.2f}% (Threshold: {cpu_threshold}%)"
+                        t('health.high_cpu'),
+                        t('health.usage_threshold', percent=cpu_percent, threshold=cpu_threshold)
                     )
 
         except docker.errors.NotFound:
                 self.alert_manager.add_alert(
                     self.service_name,
-                    f"Container Missing",
-                    f"Container '{container_name}' not found"
+                    t('health.container_missing'),
+                    t('health.container_not_found', container=container_name)
                 )
 
     def check_http(self):
@@ -809,14 +814,14 @@ class HealthMonitor(threading.Thread):
             if resp.status_code >= 400:
                  self.alert_manager.add_alert(
                     self.service_name,
-                    "HTTP Health Check Failed",
-                    f"URL: {url}\nStatus Code: {resp.status_code}"
+                    t('health.http_failed'),
+                    t('health.http_detail', url=url, code=resp.status_code)
                 )
         except Exception as e:
              self.alert_manager.add_alert(
                 self.service_name,
-                "HTTP Connection Failed",
-                f"URL: {url}\nError: {str(e)}"
+                t('health.http_conn_failed'),
+                t('health.http_conn_detail', url=url, error=str(e))
             )
 
     def check_tcp(self):
@@ -831,13 +836,13 @@ class HealthMonitor(threading.Thread):
             if result != 0:
                  self.alert_manager.add_alert(
                     self.service_name,
-                    "TCP Health Check Failed",
-                    f"Host: {host}:{port}\nResult Code: {result} (Not 0)"
+                    t('health.tcp_failed'),
+                    t('health.tcp_detail', host=host, port=port, code=result)
                 )
         except Exception as e:
             self.alert_manager.add_alert(
                 self.service_name,
-                "TCP Connection Error",
+                t('health.tcp_conn_error'),
                 str(e)
             )
         finally:
@@ -857,8 +862,8 @@ class HealthMonitor(threading.Thread):
             
             self.alert_manager.add_alert(
                 self.service_name,
-                "CRITICAL: Service Auto-Restarted (Health Check)",
-                f"Container '{container_name}' was found in '{current_status}' state and restarted.",
+                t('health.restart_critical'),
+                t('health.restart_detail', container=container_name, status=current_status),
                 immediate=True
             )
 
@@ -869,8 +874,8 @@ class HealthMonitor(threading.Thread):
             logging.error(f"[{self.service_name}] Health-check auto-restart failed: {e}")
             self.alert_manager.add_alert(
                 self.service_name,
-                "Auto-Restart FAILED",
-                f"Attempted to restart '{container_name}' but failed: {e}"
+                t('health.restart_failed'),
+                t('health.restart_failed_detail', container=container_name, error=e)
             )
 
     def wait_for_recovery(self, container_name):
@@ -899,15 +904,15 @@ class HealthMonitor(threading.Thread):
                 if container.status == 'running':
                     self.alert_manager.add_alert(
                         self.service_name,
-                        "RECOVERY: Service Restarted Successfully",
-                        f"Container '{container_name}' is back to 'running' state after health-check restart.",
+                        t('health.recovery_success'),
+                        t('health.recovery_detail', container=container_name),
                         immediate=True
                     )
                     logging.info(f"[{self.service_name}] Recovery detected and notified.")
                     return
             except Exception as e:
                 logging.warning(f"[{self.service_name}] Error checking recovery status: {e}")
-        
+
         logging.error(f"[{self.service_name}] Recovery check timed out (Container not running after 5m).")
 
 class SystemResourceMonitor(threading.Thread):
@@ -955,9 +960,9 @@ class SystemResourceMonitor(threading.Thread):
                 usage = psutil.disk_usage(path)
                 if usage.percent > disk_cfg.get('alert_threshold', 90):
                     self.alert_manager.add_alert(
-                        "System Resource Alert",
-                        f"Disk usage on '{path}' is critical: {usage.percent}% (Free: {usage.free / (1024**3):.2f} GB)",
-                        "system-disk"
+                        "system-disk",
+                        t('sys.alert_name'),
+                        t('sys.disk_critical', path=path, percent=usage.percent, free=usage.free / (1024**3))
                     )
             except Exception as e:
                 logging.error(f"Disk check failed: {e}")
@@ -968,9 +973,9 @@ class SystemResourceMonitor(threading.Thread):
             mem = psutil.virtual_memory()
             if mem.percent > mem_cfg.get('alert_threshold', 90):
                  self.alert_manager.add_alert(
-                    "System Resource Alert",
-                    f"Memory usage is critical: {mem.percent}% (Available: {mem.available / (1024**3):.2f} GB)",
-                    "system-memory"
+                    "system-memory",
+                    t('sys.alert_name'),
+                    t('sys.memory_critical', percent=mem.percent, available=mem.available / (1024**3))
                 )
 
         # 3. CPU Check
@@ -990,9 +995,9 @@ class SystemResourceMonitor(threading.Thread):
                     self.cpu_high_start_time = time.time()
                 elif time.time() - self.cpu_high_start_time > duration:
                     self.alert_manager.add_alert(
-                        "System Resource Alert",
-                        f"CPU usage high for over {duration}s: {cpu_percent}%",
-                        "system-cpu"
+                        "system-cpu",
+                        t('sys.alert_name'),
+                        t('sys.cpu_high', duration=duration, percent=cpu_percent)
                     )
             else:
                 self.cpu_high_start_time = None
@@ -1002,29 +1007,28 @@ class SystemResourceMonitor(threading.Thread):
 
     def get_report_data(self):
         if not psutil:
-            return ["System Monitor: psutil not installed"]
+            return [t('sys.psutil_missing')]
 
-        lines = ["[Server Health]", "----------------"]
-        
-        # Host info
-        lines.append(f"Hostname : {socket.gethostname()}")
-        
+        lines = [t('report.server_health'), "----------------"]
+
+        lines.append(t('report.hostname', hostname=socket.gethostname()))
+
         # CPU
         if self.stats['cpu_usage_samples']:
             avg_cpu = sum(self.stats['cpu_usage_samples']) / len(self.stats['cpu_usage_samples'])
             max_cpu = max(self.stats['cpu_usage_samples'])
             core_count = psutil.cpu_count(logical=True)
-            lines.append(f"CPU      : Current: {psutil.cpu_percent()}% ({core_count} Cores) | Avg(24h): {avg_cpu:.1f}% | Peak: {max_cpu:.1f}%")
-        
+            lines.append(t('report.cpu', current=psutil.cpu_percent(), cores=core_count, avg=avg_cpu, peak=max_cpu))
+
         # Memory
         mem = psutil.virtual_memory()
-        lines.append(f"Memory   : Used: {mem.used / (1024**3):.2f}GB / {mem.total / (1024**3):.2f}GB ({mem.percent}%)")
-        
+        lines.append(t('report.memory', used=mem.used / (1024**3), total=mem.total / (1024**3), percent=mem.percent))
+
         # Disk
         disk_path = self.config.get('disk', {}).get('path', '/')
         try:
             d = psutil.disk_usage(disk_path)
-            lines.append(f"Disk ({disk_path}) : {d.percent}% Used (Free: {d.free / (1024**3):.2f}GB)")
+            lines.append(t('report.disk', path=disk_path, percent=d.percent, free=d.free / (1024**3)))
         except:
             pass
 
@@ -1034,7 +1038,7 @@ class SystemResourceMonitor(threading.Thread):
             start = self.stats['net_io_start']
             sent = (curr.bytes_sent - start.bytes_sent) / (1024**3)
             recv = (curr.bytes_recv - start.bytes_recv) / (1024**3)
-            lines.append(f"Network  : Rx: {recv:.2f}GB | Tx: {sent:.2f}GB (Since start)")
+            lines.append(t('report.network', recv=recv, sent=sent))
 
         return lines
 
@@ -1047,37 +1051,38 @@ class DailySummaryReporter:
 
     def send_report(self):
         try:
-            lines = ["Daily Service Status Summary", "============================"]
-            
+            report_title = t('report.title')
+            lines = [report_title, "=" * len(report_title)]
+
             if self.system_monitor:
                 lines.extend(self.system_monitor.get_report_data())
-                lines.append("") # Empty line
+                lines.append("")
 
             for service in self.services:
                 name = service['name']
-                lines.append(f"\nService: {name}")
-                
+                lines.append(f"\n{t('report.service_label', name=name)}")
+
                 # Docker Status
                 container_name = service.get('docker_container_name')
                 if container_name:
-                    status = "UNKNOWN"
+                    status = t('report.status_unknown')
                     if self.docker_client:
                         try:
                             container = self.docker_client.containers.get(container_name)
                             status = container.status.upper()
                         except docker.errors.NotFound:
-                            status = "MISSING"
+                            status = t('report.status_missing')
                         except Exception as e:
-                            status = f"ERROR: {str(e)}"
+                            status = t('report.status_error', error=str(e))
                     else:
-                        status = "Docker Client Unavailable"
-                    lines.append(f"  Container '{container_name}': {status}")
-                
+                        status = t('report.docker_unavailable')
+                    lines.append(t('report.container_status', container=container_name, status=status))
+
                 # Health Check Status
                 if 'health_check' in service:
                     hc = service['health_check']
                     check_type = hc.get('type', 'Auto/Docker')
-                    lines.append(f"  Health Check: Enabled ({check_type})")
+                    lines.append(t('report.health_check', type=check_type))
 
                 # Log Status
                 log_path = service.get('log_file_path')
@@ -1086,15 +1091,15 @@ class DailySummaryReporter:
                         try:
                             size = os.path.getsize(log_path)
                             modified = datetime.fromtimestamp(os.path.getmtime(log_path)).strftime('%Y-%m-%d %H:%M:%S')
-                            lines.append(f"  Log File: {log_path} (Size: {size} bytes, Last Modified: {modified})")
+                            lines.append(t('report.log_file_stats', path=log_path, size=size, modified=modified))
                         except OSError:
-                            lines.append(f"  Log File: {log_path} (Cannot read stats)")
+                            lines.append(t('report.log_file_unreadable', path=log_path))
                     else:
-                        lines.append(f"  Log File: {log_path} (NOT FOUND)")
-            
+                        lines.append(t('report.log_file_missing', path=log_path))
+
             body = "\n".join(lines)
             logging.info("Sending daily summary...")
-            self.email_sender.send_email_immediate("Daily Service Summary", body, is_alert=False)
+            self.email_sender.send_email_immediate(t('report.subject'), body, is_alert=False)
         except Exception as e:
             logging.error(f"Failed to generate or send daily report: {e}")
 
@@ -1110,7 +1115,8 @@ def main():
 
     config = Config(config_path)
     setup_logging(config.data)
-    
+    i18n.init(config.language)
+
     email_sender = EmailSender(config.email_config)
     
     # Initialize Global Docker Client
@@ -1143,15 +1149,15 @@ def main():
     for service in config.services:
         # Start Log Monitors
         if service.get('log_file_path'):
-            t = LogMonitor(service, config.keywords, config.restart_keywords, alert_manager, docker_client=global_docker)
-            t.start()
-            threads.append(t)
-        
+            mon = LogMonitor(service, config.keywords, config.restart_keywords, alert_manager, docker_client=global_docker)
+            mon.start()
+            threads.append(mon)
+
         # Start Health Monitors (Explicit or Implicit via Docker)
         if service.get('health_check') or service.get('docker_container_name'):
-            t = HealthMonitor(service, alert_manager, docker_client=global_docker)
-            t.start()
-            threads.append(t)
+            mon = HealthMonitor(service, alert_manager, docker_client=global_docker)
+            mon.start()
+            threads.append(mon)
 
     # Setup Scheduled Summaries
     summary_reporter = DailySummaryReporter(config, email_sender, system_monitor, docker_client=global_docker)
@@ -1167,15 +1173,15 @@ def main():
         # Signal all threads to stop
         alert_manager.stop_event.set()
         system_monitor.stop_event.set()
-        for t in threads:
-            t.stop_event.set()
-        
+        for th in threads:
+            th.stop_event.set()
+
         # Wait for threads to finish (graceful shutdown)
         logging.info("Waiting for threads to exit...")
         alert_manager.join(timeout=5)
         system_monitor.join(timeout=5)
-        for t in threads:
-            t.join(timeout=2)
+        for th in threads:
+            th.join(timeout=2)
             
         logging.info("All monitors stopped. Exiting.")
         sys.exit(0)
